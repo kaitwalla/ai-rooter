@@ -18,6 +18,9 @@ By default settings are stored at your OS config path, usually:
 ~/Library/Application Support/rooter/config.json
 ```
 
+Rooter creates a random admin token in this file on first run. Use that token in
+the admin UI, or set `ROOTER_ADMIN_TOKEN` to override the saved token.
+
 Override it when deploying:
 
 ```sh
@@ -53,6 +56,13 @@ For local builds, pass the update repository explicitly:
 ```sh
 ROOTER_UPDATE_REPO=owner/repo ./rooter -update
 ```
+
+Updates require a matching SHA-256 sidecar asset and Ed25519 signature named
+after the executable, for example `rooter-linux-amd64.sha256` and
+`rooter-linux-amd64.sha256.sig`. Release builds embed
+`ROOTER_UPDATE_PUBLIC_KEY` from GitHub Actions variables as a base64 or hex
+encoded raw Ed25519 public key, and tagged release builds sign with the
+PEM-encoded Ed25519 private key in the `ROOTER_UPDATE_SIGNING_KEY` secret.
 
 ## Providers
 
@@ -95,7 +105,9 @@ Authorization: Bearer <rooter-public-api-key>
 
 ## Admin security
 
-Set an admin token in the UI or with `ROOTER_ADMIN_TOKEN`. If `ROOTER_ADMIN_TOKEN` is set, it overrides the saved admin token.
+Rooter requires an admin token for the admin API. A token is generated in the
+settings file when one is missing. Set `ROOTER_ADMIN_TOKEN` to override the saved
+admin token.
 
 The admin API accepts either:
 

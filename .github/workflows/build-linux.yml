@@ -4,7 +4,7 @@ on:
   push:
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
   build:
@@ -25,28 +25,59 @@ jobs:
         run: go test ./...
 
       - name: Build Linux amd64 executable
+        env:
+          ROOTER_UPDATE_PUBLIC_KEY: ${{ vars.ROOTER_UPDATE_PUBLIC_KEY }}
+          ROOTER_UPDATE_SIGNING_KEY: ${{ secrets.ROOTER_UPDATE_SIGNING_KEY }}
         run: |
           mkdir -p dist
           VERSION="${GITHUB_REF_NAME}"
           if [[ "${GITHUB_REF_TYPE}" != "tag" ]]; then
             VERSION="${GITHUB_SHA::12}"
           fi
-          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -ldflags="-s -w -X main.version=${VERSION} -X main.repository=${GITHUB_REPOSITORY}" -o dist/rooter-linux-amd64 .
+          if [[ "${GITHUB_REF_TYPE}" == "tag" ]]; then
+            if [[ -z "${ROOTER_UPDATE_PUBLIC_KEY}" || -z "${ROOTER_UPDATE_SIGNING_KEY}" ]]; then
+              echo "Tagged releases require ROOTER_UPDATE_PUBLIC_KEY and ROOTER_UPDATE_SIGNING_KEY."
+              exit 1
+            fi
+          fi
+          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -ldflags="-s -w -X main.version=${VERSION} -X main.repository=${GITHUB_REPOSITORY} -X main.updatePublicKey=${ROOTER_UPDATE_PUBLIC_KEY}" -o dist/rooter-linux-amd64 .
+          (cd dist && sha256sum rooter-linux-amd64 > rooter-linux-amd64.sha256)
+          if [[ "${GITHUB_REF_TYPE}" == "tag" ]]; then
+            printf '%s' "${ROOTER_UPDATE_SIGNING_KEY}" > /tmp/rooter-update-signing-key.pem
+            printf '%s' "$(cut -d ' ' -f 1 dist/rooter-linux-amd64.sha256)" > /tmp/rooter-update-digest.txt
+            openssl pkeyutl -sign -rawin -inkey /tmp/rooter-update-signing-key.pem -in /tmp/rooter-update-digest.txt -out /tmp/rooter-update-signature.bin
+            base64 -w0 /tmp/rooter-update-signature.bin > dist/rooter-linux-amd64.sha256.sig
+            printf '\n' >> dist/rooter-linux-amd64.sha256.sig
+          fi
 
       - name: Upload executable
         uses: actions/upload-artifact@v4
         with:
           name: rooter-linux-amd64
-          path: dist/rooter-linux-amd64
+          path: dist/rooter-linux-amd64*
           if-no-files-found: error
 
+  release:
+    name: Publish Linux release asset
+    if: github.ref_type == 'tag'
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Download executable
+        uses: actions/download-artifact@v4
+        with:
+          name: rooter-linux-amd64
+          path: dist
+
       - name: Publish release asset
-        if: github.ref_type == 'tag'
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           if gh release view "${GITHUB_REF_NAME}" >/dev/null 2>&1; then
-            gh release upload "${GITHUB_REF_NAME}" dist/rooter-linux-amd64 --clobber
+            gh release upload "${GITHUB_REF_NAME}" dist/rooter-linux-amd64 dist/rooter-linux-amd64.sha256 dist/rooter-linux-amd64.sha256.sig --clobber
           else
-            gh release create "${GITHUB_REF_NAME}" dist/rooter-linux-amd64 --title "${GITHUB_REF_NAME}" --generate-notes
+            gh release create "${GITHUB_REF_NAME}" dist/rooter-linux-amd64 dist/rooter-linux-amd64.sha256 dist/rooter-linux-amd64.sha256.sig --title "${GITHUB_REF_NAME}" --generate-notes
           fi

@@ -175,6 +175,7 @@ func TestActivateAddsModelsAndPullsOllama(t *testing.T) {
 		"pull":true,
 		"enable":true
 	}`))
+	authorizeAdmin(req, app)
 	req.Header.Set("Content-Type", "application/json")
 	rec := httptest.NewRecorder()
 	app.routes().ServeHTTP(rec, req)
@@ -218,6 +219,7 @@ func TestActivateDoesNotOverwriteSamePublicNameFromDifferentProvider(t *testing.
 		"pull":false,
 		"enable":true
 	}`))
+	authorizeAdmin(req, app)
 	req.Header.Set("Content-Type", "application/json")
 	rec := httptest.NewRecorder()
 	app.routes().ServeHTTP(rec, req)
@@ -249,6 +251,44 @@ func TestRejectsClientKeyWhenNoPublicKeysConfigured(t *testing.T) {
 	if rec.Code != http.StatusUnauthorized {
 		t.Fatalf("status = %d body = %s", rec.Code, rec.Body.String())
 	}
+}
+
+func TestAdminAPIRequiresToken(t *testing.T) {
+	app := testApp(t, Config{
+		Providers: []Provider{{ID: "p", Name: "Provider", Type: "openai", BaseURL: "http://example.test/v1", Enabled: true}},
+	})
+
+	req := httptest.NewRequest(http.MethodGet, "/admin/api/config", nil)
+	rec := httptest.NewRecorder()
+	app.routes().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("status = %d body = %s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestNormalizeConfigRejectsUnsafeProviderURLs(t *testing.T) {
+	tests := []string{
+		"file:///tmp/provider",
+		"https://user:pass@example.test/v1",
+		"http://169.254.169.254/latest",
+		"http://[fe80::1]/api",
+		"http://metadata.google.internal/computeMetadata/v1",
+	}
+	for _, baseURL := range tests {
+		t.Run(baseURL, func(t *testing.T) {
+			_, err := normalizeConfig(Config{
+				Providers: []Provider{{ID: "p", Name: "Provider", Type: "openai", BaseURL: baseURL, Enabled: true}},
+			})
+			if err == nil {
+				t.Fatal("normalizeConfig accepted unsafe provider URL")
+			}
+		})
+	}
+}
+
+func authorizeAdmin(req *http.Request, app *App) {
+	req.Header.Set("Authorization", "Bearer "+app.adminToken())
 }
 
 func testApp(t *testing.T, cfg Config) *App {

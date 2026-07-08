@@ -1,9 +1,13 @@
 package main
 
 import (
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net/netip"
+	"net/url"
 	"os"
 	"path/filepath"
 	"slices"
@@ -78,6 +82,7 @@ func (s *Store) Replace(next Config) error {
 func (s *Store) load() error {
 	if _, err := os.Stat(s.path); errors.Is(err, os.ErrNotExist) {
 		cfg := Config{
+			AdminToken: generateAdminToken(),
 			Providers: []Provider{
 				{
 					ID:      "local-ollama",
@@ -115,12 +120,20 @@ func (s *Store) load() error {
 	if err != nil {
 		return err
 	}
+	if normalized.AdminToken != cfg.AdminToken {
+		if err := writeConfigAtomic(s.path, normalized); err != nil {
+			return err
+		}
+	}
 	s.cfg = normalized
 	return nil
 }
 
 func normalizeConfig(cfg Config) (Config, error) {
 	cfg.AdminToken = strings.TrimSpace(cfg.AdminToken)
+	if cfg.AdminToken == "" {
+		cfg.AdminToken = generateAdminToken()
+	}
 	cfg.PublicAPIKeys = compactUnique(cfg.PublicAPIKeys)
 	if cfg.Providers == nil {
 		cfg.Providers = []Provider{}
@@ -161,6 +174,9 @@ func normalizeConfig(cfg Config) (Config, error) {
 		if p.BaseURL == "" {
 			return cfg, fmt.Errorf("provider %q needs a base URL", p.ID)
 		}
+		if err := validateProviderBaseURL(p.BaseURL); err != nil {
+			return cfg, fmt.Errorf("provider %q has invalid base URL: %w", p.ID, err)
+		}
 	}
 
 	modelKeys := map[string]bool{}
@@ -194,6 +210,49 @@ func normalizeConfig(cfg Config) (Config, error) {
 		cfg.Models[i].Order = i + 1
 	}
 	return cfg, nil
+}
+
+func generateAdminToken() string {
+	var bytes [32]byte
+	if _, err := rand.Read(bytes[:]); err != nil {
+		panic(fmt.Sprintf("generate admin token: %v", err))
+	}
+	return "rta_" + hex.EncodeToString(bytes[:])
+}
+
+func validateProviderBaseURL(raw string) error {
+	parsed, err := url.Parse(raw)
+	if err != nil {
+		return err
+	}
+	if parsed.Scheme != "http" && parsed.Scheme != "https" {
+		return errors.New("scheme must be http or https")
+	}
+	if parsed.Host == "" || parsed.Hostname() == "" {
+		return errors.New("host is required")
+	}
+	if parsed.User != nil {
+		return errors.New("credentials in URLs are not allowed")
+	}
+	host := parsed.Hostname()
+	if isBlockedLinkLocalHost(host) {
+		return errors.New("link-local metadata addresses are not allowed")
+	}
+	return nil
+}
+
+func isBlockedLinkLocalHost(host string) bool {
+	if strings.EqualFold(host, "metadata.google.internal") {
+		return true
+	}
+	if ip, err := netip.ParseAddr(host); err == nil {
+		return isLinkLocalMetadataIP(ip)
+	}
+	return false
+}
+
+func isLinkLocalMetadataIP(ip netip.Addr) bool {
+	return ip.IsLinkLocalUnicast()
 }
 
 func writeConfigAtomic(path string, cfg Config) error {
