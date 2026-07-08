@@ -1,0 +1,26 @@
+# Build artifacts
+/rooter
+/dist/
+*.exe
+*.test
+*.out
+
+# Go workspace/vendor files
+go.work
+go.work.sum
+vendor/
+
+# Coverage and profiling
+coverage.out
+*.prof
+
+# Local environment
+.env
+.env.*
+
+# Editor and OS files
+.DS_Store
+.idea/
+.vscode/
+*.swp
+*.swo

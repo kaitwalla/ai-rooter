@@ -1,0 +1,52 @@
+name: Build Linux
+
+on:
+  push:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build Linux executable
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Test
+        run: go test ./...
+
+      - name: Build Linux amd64 executable
+        run: |
+          mkdir -p dist
+          VERSION="${GITHUB_REF_NAME}"
+          if [[ "${GITHUB_REF_TYPE}" != "tag" ]]; then
+            VERSION="${GITHUB_SHA::12}"
+          fi
+          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -ldflags="-s -w -X main.version=${VERSION} -X main.repository=${GITHUB_REPOSITORY}" -o dist/rooter-linux-amd64 .
+
+      - name: Upload executable
+        uses: actions/upload-artifact@v4
+        with:
+          name: rooter-linux-amd64
+          path: dist/rooter-linux-amd64
+          if-no-files-found: error
+
+      - name: Publish release asset
+        if: github.ref_type == 'tag'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if gh release view "${GITHUB_REF_NAME}" >/dev/null 2>&1; then
+            gh release upload "${GITHUB_REF_NAME}" dist/rooter-linux-amd64 --clobber
+          else
+            gh release create "${GITHUB_REF_NAME}" dist/rooter-linux-amd64 --title "${GITHUB_REF_NAME}" --generate-notes
+          fi
