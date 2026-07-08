@@ -36,11 +36,17 @@ type Provider struct {
 }
 
 type ModelMapping struct {
-	PublicName   string `json:"public_name"`
+	PublicName   string      `json:"public_name"`
+	ProviderID   string      `json:"provider_id"`
+	UpstreamName string      `json:"upstream_name"`
+	Chain        []ChainStep `json:"chain,omitempty"`
+	Enabled      bool        `json:"enabled"`
+	Order        int         `json:"order"`
+}
+
+type ChainStep struct {
 	ProviderID   string `json:"provider_id"`
 	UpstreamName string `json:"upstream_name"`
-	Enabled      bool   `json:"enabled"`
-	Order        int    `json:"order"`
 }
 
 type Store struct {
@@ -194,6 +200,17 @@ func normalizeConfig(cfg Config) (Config, error) {
 		if m.UpstreamName == "" {
 			m.UpstreamName = m.PublicName
 		}
+		for j := range m.Chain {
+			step := &m.Chain[j]
+			step.ProviderID = slugify(step.ProviderID)
+			step.UpstreamName = strings.TrimSpace(step.UpstreamName)
+			if step.ProviderID == "" || !providerIDs[step.ProviderID] {
+				return cfg, fmt.Errorf("model %q chain step %d references unknown provider %q", m.PublicName, j+1, step.ProviderID)
+			}
+			if step.UpstreamName == "" {
+				return cfg, fmt.Errorf("model %q chain step %d needs an upstream model", m.PublicName, j+1)
+			}
+		}
 		key := strings.ToLower(m.PublicName)
 		if modelKeys[key] {
 			return cfg, fmt.Errorf("duplicate public model name %q", m.PublicName)
@@ -276,6 +293,9 @@ func cloneConfig(cfg Config) Config {
 	out.PublicAPIKeys = slices.Clone(cfg.PublicAPIKeys)
 	out.Providers = slices.Clone(cfg.Providers)
 	out.Models = slices.Clone(cfg.Models)
+	for i := range out.Models {
+		out.Models[i].Chain = slices.Clone(cfg.Models[i].Chain)
+	}
 	return out
 }
 

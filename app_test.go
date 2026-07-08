@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestModelsEndpointReturnsEnabledModelsInOrder(t *testing.T) {
@@ -22,7 +23,7 @@ func TestModelsEndpointReturnsEnabledModelsInOrder(t *testing.T) {
 			{PublicName: "z", ProviderID: "a", UpstreamName: "z-up", Enabled: true, Order: 2},
 			{PublicName: "hidden", ProviderID: "a", UpstreamName: "hidden", Enabled: false, Order: 1},
 			{PublicName: "disabled-provider", ProviderID: "b", UpstreamName: "x", Enabled: true, Order: 3},
-			{PublicName: "a", ProviderID: "a", UpstreamName: "a-up", Enabled: true, Order: 0},
+			{PublicName: "a", ProviderID: "a", UpstreamName: "a-up", Chain: []ChainStep{{ProviderID: "a", UpstreamName: "a-fallback"}}, Enabled: true, Order: 0},
 		},
 	})
 
@@ -92,6 +93,170 @@ func TestProxyRewritesModelAndProviderAuth(t *testing.T) {
 	}
 	if !strings.Contains(upstreamBody, `"model":"real"`) {
 		t.Fatalf("upstream body = %s", upstreamBody)
+	}
+}
+
+func TestChainFallsBackOnAnyFourHundredStatus(t *testing.T) {
+	var primaryBody, fallbackBody string
+	primary := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		primaryBody = string(body)
+		writeOpenAIError(w, http.StatusForbidden, "forbidden", "no")
+	}))
+	defer primary.Close()
+	fallback := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		fallbackBody = string(body)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":"fallback-ok"}`))
+	}))
+	defer fallback.Close()
+
+	app := testApp(t, Config{
+		PublicAPIKeys: []string{"client-key"},
+		Providers: []Provider{
+			{ID: "primary", Name: "Primary", Type: "openai", BaseURL: primary.URL + "/v1", Enabled: true},
+			{ID: "fallback", Name: "Fallback", Type: "openai", BaseURL: fallback.URL + "/v1", Enabled: true},
+		},
+		Models: []ModelMapping{
+			{
+				PublicName:   "public",
+				ProviderID:   "primary",
+				UpstreamName: "primary-real",
+				Chain:        []ChainStep{{ProviderID: "fallback", UpstreamName: "fallback-real"}},
+				Enabled:      true,
+				Order:        1,
+			},
+		},
+	})
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"public","messages":[]}`))
+	req.Header.Set("Authorization", "Bearer client-key")
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	app.routes().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d body = %s", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(primaryBody, `"model":"primary-real"`) {
+		t.Fatalf("primary body = %s", primaryBody)
+	}
+	if !strings.Contains(fallbackBody, `"model":"fallback-real"`) {
+		t.Fatalf("fallback body = %s", fallbackBody)
+	}
+	if !strings.Contains(rec.Body.String(), "fallback-ok") {
+		t.Fatalf("response body = %s", rec.Body.String())
+	}
+}
+
+func TestChainDoesNotFallBackOnNonFourHundredStatus(t *testing.T) {
+	fallbackCalled := false
+	primary := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		writeOpenAIError(w, http.StatusInternalServerError, "upstream_down", "down")
+	}))
+	defer primary.Close()
+	fallback := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		fallbackCalled = true
+		_, _ = w.Write([]byte(`{"id":"should-not-run"}`))
+	}))
+	defer fallback.Close()
+
+	app := testApp(t, Config{
+		PublicAPIKeys: []string{"client-key"},
+		Providers: []Provider{
+			{ID: "primary", Name: "Primary", Type: "openai", BaseURL: primary.URL + "/v1", Enabled: true},
+			{ID: "fallback", Name: "Fallback", Type: "openai", BaseURL: fallback.URL + "/v1", Enabled: true},
+		},
+		Models: []ModelMapping{
+			{
+				PublicName:   "public",
+				ProviderID:   "primary",
+				UpstreamName: "primary-real",
+				Chain:        []ChainStep{{ProviderID: "fallback", UpstreamName: "fallback-real"}},
+				Enabled:      true,
+				Order:        1,
+			},
+		},
+	})
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"public","messages":[]}`))
+	req.Header.Set("Authorization", "Bearer client-key")
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	app.routes().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusInternalServerError {
+		t.Fatalf("status = %d body = %s", rec.Code, rec.Body.String())
+	}
+	if fallbackCalled {
+		t.Fatal("fallback was called for a non-4xx response")
+	}
+}
+
+func TestChainSkipsRateLimitedStepUntilRetryAfter(t *testing.T) {
+	primaryCalls := 0
+	fallbackCalls := 0
+	primary := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		primaryCalls++
+		w.Header().Set("Retry-After", "60")
+		writeOpenAIError(w, http.StatusTooManyRequests, "rate_limited", "try later")
+	}))
+	defer primary.Close()
+	fallback := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		fallbackCalls++
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":"fallback-ok"}`))
+	}))
+	defer fallback.Close()
+
+	app := testApp(t, Config{
+		PublicAPIKeys: []string{"client-key"},
+		Providers: []Provider{
+			{ID: "primary", Name: "Primary", Type: "openai", BaseURL: primary.URL + "/v1", Enabled: true},
+			{ID: "fallback", Name: "Fallback", Type: "openai", BaseURL: fallback.URL + "/v1", Enabled: true},
+		},
+		Models: []ModelMapping{
+			{
+				PublicName:   "public",
+				ProviderID:   "primary",
+				UpstreamName: "primary-real",
+				Chain:        []ChainStep{{ProviderID: "fallback", UpstreamName: "fallback-real"}},
+				Enabled:      true,
+				Order:        1,
+			},
+		},
+	})
+
+	for i := 0; i < 2; i++ {
+		req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"public","messages":[]}`))
+		req.Header.Set("Authorization", "Bearer client-key")
+		req.Header.Set("Content-Type", "application/json")
+		rec := httptest.NewRecorder()
+		app.routes().ServeHTTP(rec, req)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("request %d status = %d body = %s", i+1, rec.Code, rec.Body.String())
+		}
+	}
+	if primaryCalls != 1 {
+		t.Fatalf("primary calls = %d want 1", primaryCalls)
+	}
+	if fallbackCalls != 2 {
+		t.Fatalf("fallback calls = %d want 2", fallbackCalls)
+	}
+}
+
+func TestParseRetryAfterDefaultsToThirtyMinutes(t *testing.T) {
+	now := time.Date(2026, 7, 8, 12, 0, 0, 0, time.UTC)
+	if got := parseRetryAfter("", now); !got.Equal(now.Add(30 * time.Minute)) {
+		t.Fatalf("empty retry-after = %s", got)
+	}
+	if got := parseRetryAfter("120", now); !got.Equal(now.Add(2 * time.Minute)) {
+		t.Fatalf("seconds retry-after = %s", got)
+	}
+	date := "Wed, 08 Jul 2026 12:05:00 GMT"
+	if got := parseRetryAfter(date, now); !got.Equal(now.Add(5 * time.Minute)) {
+		t.Fatalf("date retry-after = %s", got)
 	}
 }
 

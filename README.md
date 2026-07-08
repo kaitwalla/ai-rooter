@@ -60,7 +60,7 @@ ROOTER_UPDATE_REPO=owner/repo ./rooter -update
 Updates require a matching SHA-256 sidecar asset and Ed25519 signature named
 after the executable, for example `rooter-linux-amd64.sha256` and
 `rooter-linux-amd64.sha256.sig`. Release builds embed
-`ROOTER_UPDATE_PUBLIC_KEY` from GitHub Actions variables as a base64 or hex
+`ROOTER_UPDATE_PUBLIC_KEY` from GitHub Actions secrets as a base64 or hex
 encoded raw Ed25519 public key, and tagged release builds sign with the
 PEM-encoded Ed25519 private key in the `ROOTER_UPDATE_SIGNING_KEY` secret.
 
@@ -84,6 +84,12 @@ The admin UI supports two ways to add models:
 Manual activation is useful for cloud models that do not show up in a list endpoint. For Ollama providers, you can optionally call `/api/pull` before saving the model row. For direct Ollama Cloud usage, Rooter still sends inference requests to `https://ollama.com/api` with the provider API key configured in the admin UI.
 
 Rooter does not pass client API keys through. Clients authenticate to Rooter with one of the public API keys configured in the admin UI. Rooter sends each provider its own configured API key.
+
+## Model chains
+
+A visible model can have chain fallback steps. Clients still see and request one regular public model name; Rooter tries the row's primary provider/model first, then each configured chain step if the upstream returns any `4xx` response.
+
+`429` responses also put that provider/model step on cooldown. Rooter uses `Retry-After` when present, and otherwise waits 30 minutes before trying that step again. Non-`4xx` responses, including upstream `5xx` errors, are returned without falling through the chain.
 
 ## Endpoints
 

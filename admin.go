@@ -234,6 +234,7 @@ const adminHTML = `<!doctype html>
               <th>Public name</th>
               <th>Provider</th>
               <th>Upstream model</th>
+              <th>Chain fallback</th>
               <th style="width:140px;">Order</th>
               <th style="width:54px;"></th>
             </tr>
@@ -310,6 +311,21 @@ const adminHTML = `<!doctype html>
     function providerName(id) {
       const provider = state.config.providers.find(p => p.id === id);
       return provider ? (provider.name || provider.id) : id;
+    }
+
+    function chainToText(chain) {
+      return (chain || []).map(step => (step.provider_id || '') + '/' + (step.upstream_name || '')).join('\n');
+    }
+
+    function parseChain(value) {
+      return String(value || '').split(/\n+/).map(v => v.trim()).filter(Boolean).map(line => {
+        const slash = line.indexOf('/');
+        if (slash < 0) return { provider_id: '', upstream_name: line };
+        return {
+          provider_id: slug(line.slice(0, slash)),
+          upstream_name: line.slice(slash + 1).trim()
+        };
+      });
     }
 
     function keyFingerprint(value) {
@@ -434,6 +450,7 @@ const adminHTML = `<!doctype html>
           const id = state.config.providers[index].id;
           state.config.providers.splice(index, 1);
           state.config.models = state.config.models.filter(m => m.provider_id !== id);
+          state.config.models.forEach(m => { m.chain = (m.chain || []).filter(step => step.provider_id !== id); });
           if (state.editingProviderID === id) state.editingProviderID = '';
           hydrateForm();
         });
@@ -455,6 +472,7 @@ const adminHTML = `<!doctype html>
       if (field === 'name' && !state.config.providers[index].id) state.config.providers[index].id = slug(value);
       if (field === 'id') {
         state.config.models.forEach(m => { if (m.provider_id === oldID) m.provider_id = slug(value); });
+        state.config.models.forEach(m => (m.chain || []).forEach(step => { if (step.provider_id === oldID) step.provider_id = slug(value); }));
         state.config.providers[index].id = slug(value);
         state.editingProviderID = state.config.providers[index].id;
         els.activateProvider.innerHTML = providerOptions(els.activateProvider.value);
@@ -467,7 +485,8 @@ const adminHTML = `<!doctype html>
       els.models.innerHTML = '';
       state.config.models.sort((a, b) => (a.order || 0) - (b.order || 0)).forEach((m, index) => {
         m.order = index + 1;
-        const text = [m.public_name, m.upstream_name, m.provider_id, providerName(m.provider_id)].join(' ').toLowerCase();
+        const chainText = chainToText(m.chain);
+        const text = [m.public_name, m.upstream_name, m.provider_id, providerName(m.provider_id), chainText].join(' ').toLowerCase();
         if (filter && !text.includes(filter)) return;
         const tr = document.createElement('tr');
         tr.innerHTML =
@@ -475,6 +494,7 @@ const adminHTML = `<!doctype html>
           '<td><input data-field="public_name" value="' + escapeHTML(m.public_name) + '"></td>' +
           '<td><span class="pill">' + escapeHTML(providerName(m.provider_id)) + '</span></td>' +
           '<td><input data-field="upstream_name" value="' + escapeHTML(m.upstream_name) + '"></td>' +
+          '<td><textarea data-field="chain" rows="2" spellcheck="false" placeholder="provider-id/upstream-model">' + escapeHTML(chainText) + '</textarea></td>' +
           '<td><button class="icon" data-action="up" title="Move up">↑</button> <button class="icon" data-action="down" title="Move down">↓</button></td>' +
           '<td><button class="danger icon" data-action="delete" title="Delete">×</button></td>';
         tr.addEventListener('input', e => updateModel(index, e.target));
@@ -492,7 +512,11 @@ const adminHTML = `<!doctype html>
     function updateModel(index, target) {
       const field = target.dataset.field;
       if (!field) return;
-      state.config.models[index][field] = target.type === 'checkbox' ? target.checked : target.value;
+      if (field === 'chain') {
+        state.config.models[index].chain = parseChain(target.value);
+      } else {
+        state.config.models[index][field] = target.type === 'checkbox' ? target.checked : target.value;
+      }
     }
 
     function moveModel(index, delta) {
@@ -516,6 +540,10 @@ const adminHTML = `<!doctype html>
         m.public_name = String(m.public_name || '').trim();
         m.upstream_name = String(m.upstream_name || m.public_name).trim();
         m.provider_id = slug(m.provider_id);
+        m.chain = (m.chain || []).map(step => ({
+          provider_id: slug(step.provider_id),
+          upstream_name: String(step.upstream_name || '').trim()
+        })).filter(step => step.provider_id && step.upstream_name);
         m.order = i + 1;
       });
       return state.config;

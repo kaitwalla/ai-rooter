@@ -11,6 +11,7 @@ import (
 	"net/url"
 	"slices"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -18,6 +19,8 @@ type App struct {
 	store         *Store
 	adminTokenEnv string
 	client        *http.Client
+	cooldownMu    sync.Mutex
+	cooldowns     map[string]time.Time
 }
 
 func NewApp(store *Store, adminTokenEnv string) *App {
@@ -27,6 +30,7 @@ func NewApp(store *Store, adminTokenEnv string) *App {
 		client: &http.Client{
 			Timeout: 5 * time.Minute,
 		},
+		cooldowns: map[string]time.Time{},
 	}
 }
 
@@ -232,14 +236,7 @@ func (a *App) handleProxy(w http.ResponseWriter, r *http.Request) {
 		writeOpenAIError(w, http.StatusRequestEntityTooLarge, "request_too_large", err.Error())
 		return
 	}
-	rewritten, publicModel, err := rewriteModel(body, func(name string) (string, bool) {
-		cfg := a.store.Snapshot()
-		model, _, ok := findModelAndProvider(cfg, name)
-		if !ok || !model.Enabled {
-			return "", false
-		}
-		return model.UpstreamName, true
-	})
+	publicModel, err := readPublicModel(body)
 	if err != nil {
 		writeOpenAIError(w, http.StatusBadRequest, "invalid_request_error", err.Error())
 		return
@@ -251,11 +248,165 @@ func (a *App) handleProxy(w http.ResponseWriter, r *http.Request) {
 		writeOpenAIError(w, http.StatusNotFound, "model_not_found", fmt.Sprintf("model %q is not available", publicModel))
 		return
 	}
+	rewritten, err := rewriteModelTo(body, model.UpstreamName)
+	if err != nil {
+		writeOpenAIError(w, http.StatusBadRequest, "invalid_request_error", err.Error())
+		return
+	}
+	if len(model.Chain) > 0 {
+		a.proxyToChain(w, r, cfg, model, provider, publicModel, body, rewritten)
+		return
+	}
 	if isOllamaProvider(provider) {
 		a.proxyToOllama(w, r, provider, publicModel, rewritten)
 		return
 	}
 	a.proxyToProvider(w, r, provider, rewritten)
+}
+
+func (a *App) proxyToChain(w http.ResponseWriter, r *http.Request, cfg Config, model ModelMapping, provider Provider, publicModel string, original, primaryBody []byte) {
+	steps := []chainProviderStep{{
+		provider:     provider,
+		upstreamName: model.UpstreamName,
+		body:         primaryBody,
+	}}
+	for _, item := range model.Chain {
+		stepProvider, ok := findProvider(cfg, item.ProviderID)
+		if !ok || !stepProvider.Enabled {
+			continue
+		}
+		body, err := rewriteModelTo(original, item.UpstreamName)
+		if err != nil {
+			writeOpenAIError(w, http.StatusBadRequest, "invalid_request_error", err.Error())
+			return
+		}
+		steps = append(steps, chainProviderStep{
+			provider:     stepProvider,
+			upstreamName: item.UpstreamName,
+			body:         body,
+		})
+	}
+
+	var firstCooldown *time.Time
+	var last *bufferedResponse
+	for _, step := range steps {
+		if retryAt, ok := a.cooldownUntil(step); ok {
+			if firstCooldown == nil || retryAt.Before(*firstCooldown) {
+				t := retryAt
+				firstCooldown = &t
+			}
+			continue
+		}
+		rec := newBufferedResponse()
+		if isOllamaProvider(step.provider) {
+			a.proxyToOllama(rec, r, step.provider, publicModel, step.body)
+		} else {
+			a.proxyToProvider(rec, r, step.provider, step.body)
+		}
+		last = rec
+		if rec.Code == http.StatusTooManyRequests {
+			a.markCooldown(step, rec.Header().Get("Retry-After"))
+		}
+		if rec.Code >= 400 && rec.Code < 500 {
+			continue
+		}
+		replayRecordedResponse(w, rec)
+		return
+	}
+	if last != nil {
+		replayRecordedResponse(w, last)
+		return
+	}
+	if firstCooldown != nil {
+		delay := time.Until(*firstCooldown)
+		if delay < 0 {
+			delay = 0
+		}
+		w.Header().Set("Retry-After", fmt.Sprint(int(delay.Round(time.Second).Seconds())))
+		writeOpenAIError(w, http.StatusTooManyRequests, "upstream_rate_limited", "all chain models are waiting for retry")
+		return
+	}
+	writeOpenAIError(w, http.StatusBadGateway, "chain_unavailable", fmt.Sprintf("model %q has no enabled chain providers", publicModel))
+}
+
+type chainProviderStep struct {
+	provider     Provider
+	upstreamName string
+	body         []byte
+}
+
+func (a *App) cooldownUntil(step chainProviderStep) (time.Time, bool) {
+	key := chainCooldownKey(step)
+	a.cooldownMu.Lock()
+	defer a.cooldownMu.Unlock()
+	retryAt, ok := a.cooldowns[key]
+	if !ok {
+		return time.Time{}, false
+	}
+	if time.Now().Before(retryAt) {
+		return retryAt, true
+	}
+	delete(a.cooldowns, key)
+	return time.Time{}, false
+}
+
+func (a *App) markCooldown(step chainProviderStep, retryAfter string) {
+	a.cooldownMu.Lock()
+	defer a.cooldownMu.Unlock()
+	a.cooldowns[chainCooldownKey(step)] = parseRetryAfter(retryAfter, time.Now())
+}
+
+func chainCooldownKey(step chainProviderStep) string {
+	return step.provider.ID + "\x00" + step.upstreamName
+}
+
+func parseRetryAfter(value string, now time.Time) time.Time {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return now.Add(30 * time.Minute)
+	}
+	if seconds, err := time.ParseDuration(value + "s"); err == nil && seconds >= 0 {
+		return now.Add(seconds)
+	}
+	if parsed, err := http.ParseTime(value); err == nil && parsed.After(now) {
+		return parsed
+	}
+	return now.Add(30 * time.Minute)
+}
+
+func replayRecordedResponse(w http.ResponseWriter, rec *bufferedResponse) {
+	for key, values := range rec.header {
+		for _, value := range values {
+			w.Header().Add(key, value)
+		}
+	}
+	w.WriteHeader(rec.Code)
+	_, _ = rec.Body.WriteTo(w)
+}
+
+type bufferedResponse struct {
+	header http.Header
+	Code   int
+	Body   bytes.Buffer
+}
+
+func newBufferedResponse() *bufferedResponse {
+	return &bufferedResponse{
+		header: http.Header{},
+		Code:   http.StatusOK,
+	}
+}
+
+func (r *bufferedResponse) Header() http.Header {
+	return r.header
+}
+
+func (r *bufferedResponse) WriteHeader(status int) {
+	r.Code = status
+}
+
+func (r *bufferedResponse) Write(data []byte) (int, error) {
+	return r.Body.Write(data)
 }
 
 func (a *App) proxyToProvider(w http.ResponseWriter, r *http.Request, provider Provider, body []byte) {
@@ -421,27 +572,31 @@ func (a *App) discoverOllamaNative(ctx context.Context, provider Provider) ([]st
 	return models, nil
 }
 
-func rewriteModel(body []byte, resolve func(string) (string, bool)) ([]byte, string, error) {
+func readPublicModel(body []byte) (string, error) {
 	var payload map[string]json.RawMessage
 	if err := json.Unmarshal(body, &payload); err != nil {
-		return nil, "", err
+		return "", err
 	}
 	rawModel, ok := payload["model"]
 	if !ok {
-		return nil, "", errors.New("request body needs a model")
+		return "", errors.New("request body needs a model")
 	}
 	var publicModel string
 	if err := json.Unmarshal(rawModel, &publicModel); err != nil || publicModel == "" {
-		return nil, "", errors.New("model must be a non-empty string")
+		return "", errors.New("model must be a non-empty string")
 	}
-	upstream, ok := resolve(publicModel)
-	if !ok {
-		return nil, publicModel, fmt.Errorf("model %q is not configured", publicModel)
+	return publicModel, nil
+}
+
+func rewriteModelTo(body []byte, upstream string) ([]byte, error) {
+	var payload map[string]json.RawMessage
+	if err := json.Unmarshal(body, &payload); err != nil {
+		return nil, err
 	}
 	upstreamJSON, _ := json.Marshal(upstream)
 	payload["model"] = upstreamJSON
 	rewritten, err := json.Marshal(payload)
-	return rewritten, publicModel, err
+	return rewritten, err
 }
 
 func upstreamURL(provider Provider, incoming *url.URL) (string, error) {
