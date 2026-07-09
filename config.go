@@ -198,6 +198,7 @@ func normalizeConfig(cfg Config) (Config, error) {
 	}
 
 	chainIDs := map[string]bool{}
+	modelKeys := map[string]bool{}
 	for i := range cfg.Chains {
 		c := &cfg.Chains[i]
 		c.ID = slugify(c.ID)
@@ -215,6 +216,11 @@ func normalizeConfig(cfg Config) (Config, error) {
 		if c.Name == "" {
 			c.Name = c.ID
 		}
+		key := strings.ToLower(c.Name)
+		if modelKeys[key] {
+			return cfg, fmt.Errorf("duplicate public model name %q", c.Name)
+		}
+		modelKeys[key] = true
 		for j := range c.Steps {
 			step := &c.Steps[j]
 			step.ProviderID = slugify(step.ProviderID)
@@ -237,7 +243,6 @@ func normalizeConfig(cfg Config) (Config, error) {
 		cfg.Chains[i].Order = i + 1
 	}
 
-	modelKeys := map[string]bool{}
 	for i := range cfg.Models {
 		m := &cfg.Models[i]
 		m.PublicName = strings.TrimSpace(m.PublicName)
@@ -275,6 +280,9 @@ func normalizeConfig(cfg Config) (Config, error) {
 		}
 		key := strings.ToLower(m.PublicName)
 		if modelKeys[key] {
+			if m.ChainID != "" {
+				continue
+			}
 			return cfg, fmt.Errorf("duplicate public model name %q", m.PublicName)
 		}
 		modelKeys[key] = true

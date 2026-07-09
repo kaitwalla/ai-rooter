@@ -96,6 +96,35 @@ func TestProxyRewritesModelAndProviderAuth(t *testing.T) {
 	}
 }
 
+func TestModelsEndpointReturnsNamedChains(t *testing.T) {
+	app := testApp(t, Config{
+		PublicAPIKeys: []string{"client-key"},
+		Providers: []Provider{
+			{ID: "p", Name: "Provider", Type: "openai", BaseURL: "http://example.test/v1", Enabled: true},
+		},
+		Chains: []ModelChain{
+			{
+				ID:    "coding",
+				Name:  "Coding",
+				Steps: []ChainStep{{ProviderID: "p", UpstreamName: "deepseek-v4-flash"}},
+				Order: 1,
+			},
+		},
+	})
+
+	req := httptest.NewRequest(http.MethodGet, "/v1/models", nil)
+	req.Header.Set("Authorization", "Bearer client-key")
+	rec := httptest.NewRecorder()
+	app.routes().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d body = %s", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), `"id":"Coding"`) {
+		t.Fatalf("response body = %s", rec.Body.String())
+	}
+}
+
 func TestChainFallsBackOnAnyFourHundredStatus(t *testing.T) {
 	var primaryBody, fallbackBody string
 	primary := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -183,12 +212,9 @@ func TestNamedChainFallsBackThroughConfiguredSteps(t *testing.T) {
 				Order: 1,
 			},
 		},
-		Models: []ModelMapping{
-			{PublicName: "coding", ChainID: "coding", Enabled: true, Order: 1},
-		},
 	})
 
-	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"coding","messages":[]}`))
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"Coding","messages":[]}`))
 	req.Header.Set("Authorization", "Bearer client-key")
 	req.Header.Set("Content-Type", "application/json")
 	rec := httptest.NewRecorder()

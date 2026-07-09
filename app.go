@@ -189,9 +189,16 @@ func (a *App) handleModels(w http.ResponseWriter, r *http.Request) {
 	}
 	cfg := a.store.Snapshot()
 	data := []map[string]any{}
+	for _, chain := range cfg.Chains {
+		owner := chainOwner(cfg, chain)
+		if owner == "" {
+			continue
+		}
+		data = append(data, openAIModel(chain.Name, owner))
+	}
 	for _, model := range cfg.Models {
 		provider, ok := findProvider(cfg, model.ProviderID)
-		if !model.Enabled || !ok || !provider.Enabled {
+		if model.ChainID != "" || !model.Enabled || !ok || !provider.Enabled {
 			continue
 		}
 		data = append(data, openAIModel(model.PublicName, provider.Name))
@@ -213,8 +220,15 @@ func (a *App) handleModel(w http.ResponseWriter, r *http.Request) {
 	}
 	publicName := strings.TrimPrefix(r.URL.Path, "/v1/models/")
 	cfg := a.store.Snapshot()
+	if chain, ok := findChainByPublicName(cfg, publicName); ok {
+		owner := chainOwner(cfg, chain)
+		if owner != "" {
+			writeJSON(w, http.StatusOK, openAIModel(chain.Name, owner))
+			return
+		}
+	}
 	model, provider, ok := findModelAndProvider(cfg, publicName)
-	if !ok || !model.Enabled || !provider.Enabled {
+	if !ok || model.ChainID != "" || !model.Enabled || !provider.Enabled {
 		writeOpenAIError(w, http.StatusNotFound, "model_not_found", fmt.Sprintf("model %q is not available", publicName))
 		return
 	}
@@ -243,28 +257,23 @@ func (a *App) handleProxy(w http.ResponseWriter, r *http.Request) {
 	}
 
 	cfg := a.store.Snapshot()
-	model, provider, ok := findModelAndProvider(cfg, publicModel)
-	if !ok || !model.Enabled || !provider.Enabled {
-		writeOpenAIError(w, http.StatusNotFound, "model_not_found", fmt.Sprintf("model %q is not available", publicModel))
-		return
-	}
-	rewritten, err := rewriteModelTo(body, model.UpstreamName)
-	if err != nil {
-		writeOpenAIError(w, http.StatusBadRequest, "invalid_request_error", err.Error())
-		return
-	}
-	if model.ChainID != "" {
-		chain, ok := findConfigChain(cfg.Chains, model.ChainID)
-		if !ok {
-			writeOpenAIError(w, http.StatusBadGateway, "chain_unavailable", fmt.Sprintf("model %q references missing chain %q", publicModel, model.ChainID))
-			return
-		}
+	if chain, ok := findChainByPublicName(cfg, publicModel); ok {
 		steps, err := buildChainProviderSteps(cfg, chain.Steps, body)
 		if err != nil {
 			writeOpenAIError(w, http.StatusBadRequest, "invalid_request_error", err.Error())
 			return
 		}
 		a.proxyToChainSteps(w, r, publicModel, steps)
+		return
+	}
+	model, provider, ok := findModelAndProvider(cfg, publicModel)
+	if !ok || model.ChainID != "" || !model.Enabled || !provider.Enabled {
+		writeOpenAIError(w, http.StatusNotFound, "model_not_found", fmt.Sprintf("model %q is not available", publicModel))
+		return
+	}
+	rewritten, err := rewriteModelTo(body, model.UpstreamName)
+	if err != nil {
+		writeOpenAIError(w, http.StatusBadRequest, "invalid_request_error", err.Error())
 		return
 	}
 	if len(model.Chain) > 0 {
@@ -669,6 +678,25 @@ func findModelAndProvider(cfg Config, publicName string) (ModelMapping, Provider
 		return model, provider, ok
 	}
 	return ModelMapping{}, Provider{}, false
+}
+
+func findChainByPublicName(cfg Config, publicName string) (ModelChain, bool) {
+	for _, chain := range cfg.Chains {
+		if chain.Name == publicName {
+			return chain, true
+		}
+	}
+	return ModelChain{}, false
+}
+
+func chainOwner(cfg Config, chain ModelChain) string {
+	for _, step := range chain.Steps {
+		provider, ok := findProvider(cfg, step.ProviderID)
+		if ok && provider.Enabled {
+			return provider.Name
+		}
+	}
+	return ""
 }
 
 func addOrUpdateModelMapping(models []ModelMapping, next ModelMapping) []ModelMapping {

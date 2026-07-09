@@ -70,8 +70,7 @@ const adminHTML = `<!doctype html>
     }
     textarea { min-height: 92px; resize: vertical; overflow-wrap: anywhere; }
     table { width: 100%; border-collapse: collapse; }
-    .models-table { min-width: 760px; table-layout: fixed; }
-    .chains-table { min-width: 520px; table-layout: fixed; }
+    .models-table { min-width: 680px; table-layout: fixed; }
     th, td { border-bottom: 1px solid var(--line); padding: 8px; text-align: left; vertical-align: middle; }
     th { color: var(--muted); font-weight: 600; font-size: 12px; }
     td input, td select { min-width: 0; }
@@ -81,6 +80,9 @@ const adminHTML = `<!doctype html>
     .field-row { display: flex; gap: 6px; align-items: stretch; }
     .field-row input { flex: 1; min-width: 0; }
     .field-row button { flex: 0 0 auto; min-width: 44px; }
+    .drag-handle { width: 34px; color: var(--muted); text-align: center; cursor: grab; user-select: none; }
+    tr.dragging { opacity: .55; }
+    tr.drop-target td { background: #eef7f4; }
     .actions { display: flex; flex-wrap: wrap; gap: 8px; justify-content: flex-end; }
     button {
       border: 1px solid var(--line);
@@ -146,6 +148,27 @@ const adminHTML = `<!doctype html>
     .provider-key {
       margin-top: 10px;
     }
+    .chain-list { display: grid; gap: 10px; margin-top: 12px; }
+    .chain-card {
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      padding: 12px;
+      background: #fff;
+    }
+    .chain-head {
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) auto;
+      gap: 8px;
+      align-items: end;
+    }
+    .chain-steps { display: grid; gap: 8px; margin-top: 10px; }
+    .chain-step {
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) 36px;
+      gap: 8px;
+      align-items: center;
+    }
+    .chain-step select { min-width: 0; }
     .grid-2 { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
     .wide { grid-column: 1 / -1; }
     .checkbox { width: auto; margin-right: 7px; }
@@ -218,26 +241,15 @@ const adminHTML = `<!doctype html>
           <h2>Model chains</h2>
           <button id="addChainBtn">Add chain</button>
         </div>
-        <div class="muted">Steps use configured provider/model pairs, including models that are not shown publicly.</div>
-        <div class="scroll">
-          <table class="chains-table">
-            <thead>
-              <tr>
-                <th>Name</th>
-                <th>Steps</th>
-                <th style="width:54px;"></th>
-              </tr>
-            </thead>
-            <tbody id="chains"></tbody>
-          </table>
-        </div>
+        <div class="muted">The chain name is the public model name clients send. Steps use configured provider/model pairs, including models that are not shown publicly.</div>
+        <div id="chains" class="chain-list"></div>
       </section>
     </div>
     <section>
       <div class="toolbar">
         <div>
-          <h2>Visible models</h2>
-          <div class="muted">Only enabled rows are returned by <code>/v1/models</code>. Public names are what clients send.</div>
+          <h2>Direct models</h2>
+          <div class="muted">Single-provider model rows. Model chains are created and named in the Model chains section.</div>
         </div>
         <div class="actions">
           <button id="addModelBtn">Add model</button>
@@ -250,12 +262,11 @@ const adminHTML = `<!doctype html>
         <table class="models-table">
           <thead>
             <tr>
+              <th style="width:42px;"></th>
               <th style="width:64px;">Show</th>
               <th>Public name</th>
               <th>Provider</th>
               <th>Upstream model</th>
-              <th>Model chain</th>
-              <th style="width:140px;">Order</th>
               <th style="width:54px;"></th>
             </tr>
           </thead>
@@ -334,17 +345,6 @@ const adminHTML = `<!doctype html>
       return provider ? (provider.name || provider.id) : id;
     }
 
-    function chainName(id) {
-      const chain = (state.config.chains || []).find(c => c.id === id);
-      return chain ? (chain.name || chain.id) : id;
-    }
-
-    function chainOptions(selected) {
-      return '<option value="">Direct model</option>' + (state.config.chains || []).map(c =>
-        '<option value="' + escapeHTML(c.id) + '"' + (c.id === selected ? ' selected' : '') + '>' + escapeHTML(c.name || c.id) + '</option>'
-      ).join('');
-    }
-
     function modelValue(providerID, upstreamName) {
       return providerID + '|' + encodeURIComponent(upstreamName || '');
     }
@@ -377,11 +377,6 @@ const adminHTML = `<!doctype html>
         options.unshift('<option value="' + escapeHTML(selected) + '" selected>' + escapeHTML(providerName(selectedStep.provider_id) + ' / ' + selectedStep.upstream_name) + '</option>');
       }
       return '<option value="">Select model</option>' + options.join('');
-    }
-
-    function firstChainStep(chainID) {
-      const chain = (state.config.chains || []).find(c => c.id === chainID);
-      return chain?.steps?.[0] || null;
     }
 
     function keyFingerprint(value) {
@@ -557,38 +552,42 @@ const adminHTML = `<!doctype html>
       state.config.chains.sort((a, b) => (a.order || 0) - (b.order || 0)).forEach((chain, index) => {
         chain.order = index + 1;
         chain.steps = chain.steps || [];
-        const tr = document.createElement('tr');
+        const item = document.createElement('div');
+        item.className = 'chain-card';
         const stepRows = chain.steps.map((step, stepIndex) =>
-          '<div class="field-row" style="margin-bottom:6px;">' +
+          '<div class="chain-step">' +
           '<select data-field="chain_step" data-step="' + stepIndex + '">' + configuredModelOptions(step) + '</select>' +
           '<button class="icon" data-action="remove-step" data-step="' + stepIndex + '" title="Remove step">×</button>' +
           '</div>'
         ).join('');
-        tr.innerHTML =
-          '<td><input data-field="name" value="' + escapeHTML(chain.name || '') + '" placeholder="Coding"></td>' +
-          '<td>' + stepRows + '<button data-action="add-step">Add step</button></td>' +
-          '<td><button class="danger icon" data-action="delete" title="Delete">×</button></td>';
-        tr.addEventListener('input', e => updateChain(index, e.target));
-        tr.addEventListener('change', e => updateChain(index, e.target));
-        tr.querySelector('[data-action="add-step"]').addEventListener('click', () => {
+        item.innerHTML =
+          '<div class="chain-head">' +
+          '<div><label>Public model name</label><input data-field="name" value="' + escapeHTML(chain.name || '') + '" placeholder="Coding"></div>' +
+          '<button class="danger icon" data-action="delete" title="Delete chain">×</button>' +
+          '</div>' +
+          '<div class="chain-steps">' + stepRows + '</div>' +
+          '<div class="actions" style="justify-content:flex-start; margin-top:10px;"><button data-action="add-step">Add step</button></div>';
+        item.addEventListener('input', e => updateChain(index, e.target));
+        item.addEventListener('change', e => updateChain(index, e.target));
+        item.querySelector('[data-action="add-step"]').addEventListener('click', () => {
           const first = state.config.models.find(m => m.provider_id && m.upstream_name);
           chain.steps.push(first ? { provider_id: first.provider_id, upstream_name: first.upstream_name } : { provider_id: '', upstream_name: '' });
           renderChains();
         });
-        tr.querySelectorAll('[data-action="remove-step"]').forEach(button => {
+        item.querySelectorAll('[data-action="remove-step"]').forEach(button => {
           button.addEventListener('click', () => {
             chain.steps.splice(Number(button.dataset.step), 1);
             renderChains();
           });
         });
-        tr.querySelector('[data-action="delete"]').addEventListener('click', () => {
+        item.querySelector('[data-action="delete"]').addEventListener('click', () => {
           const id = state.config.chains[index].id;
           state.config.chains.splice(index, 1);
           state.config.models.forEach(m => { if (m.chain_id === id) m.chain_id = ''; });
           renderChains();
           renderModels();
         });
-        els.chains.appendChild(tr);
+        els.chains.appendChild(item);
       });
     }
 
@@ -608,7 +607,6 @@ const adminHTML = `<!doctype html>
           }
         }
       }
-      renderModels();
     }
 
     function renderModels() {
@@ -616,25 +614,27 @@ const adminHTML = `<!doctype html>
       els.models.innerHTML = '';
       state.config.models.sort((a, b) => (a.order || 0) - (b.order || 0)).forEach((m, index) => {
         m.order = index + 1;
-        const selectedChain = m.chain_id || '';
-        const firstStep = selectedChain ? firstChainStep(selectedChain) : null;
-        const providerLabel = firstStep ? providerName(firstStep.provider_id) : providerName(m.provider_id);
-        const upstreamLabel = firstStep ? firstStep.upstream_name : m.upstream_name;
-        const text = [m.public_name, upstreamLabel, providerLabel, selectedChain, chainName(selectedChain)].join(' ').toLowerCase();
+        if (m.chain_id) return;
+        const providerLabel = providerName(m.provider_id);
+        const upstreamLabel = m.upstream_name;
+        const text = [m.public_name, upstreamLabel, providerLabel].join(' ').toLowerCase();
         if (filter && !text.includes(filter)) return;
         const tr = document.createElement('tr');
+        tr.dataset.index = index;
         tr.innerHTML =
+          '<td class="drag-handle" draggable="true" title="Drag to reorder">↕</td>' +
           '<td><input class="checkbox" data-field="enabled" type="checkbox" ' + (m.enabled ? 'checked' : '') + '></td>' +
           '<td><input data-field="public_name" value="' + escapeHTML(m.public_name) + '"></td>' +
           '<td><span class="pill">' + escapeHTML(providerLabel) + '</span></td>' +
-          '<td><input data-field="upstream_name" value="' + escapeHTML(upstreamLabel || '') + '"' + (selectedChain ? ' disabled' : '') + '></td>' +
-          '<td><select data-field="chain_id">' + chainOptions(selectedChain) + '</select></td>' +
-          '<td><button class="icon" data-action="up" title="Move up">↑</button> <button class="icon" data-action="down" title="Move down">↓</button></td>' +
+          '<td><input data-field="upstream_name" value="' + escapeHTML(upstreamLabel || '') + '"></td>' +
           '<td><button class="danger icon" data-action="delete" title="Delete">×</button></td>';
         tr.addEventListener('input', e => updateModel(index, e.target));
         tr.addEventListener('change', e => updateModel(index, e.target));
-        tr.querySelector('[data-action="up"]').addEventListener('click', () => moveModel(index, -1));
-        tr.querySelector('[data-action="down"]').addEventListener('click', () => moveModel(index, 1));
+        tr.querySelector('.drag-handle').addEventListener('dragstart', e => startModelDrag(e, index));
+        tr.addEventListener('dragover', e => overModelDrag(e, index));
+        tr.addEventListener('dragleave', () => tr.classList.remove('drop-target'));
+        tr.addEventListener('drop', e => dropModel(e, index));
+        tr.addEventListener('dragend', clearModelDrag);
         tr.querySelector('[data-action="delete"]').addEventListener('click', () => {
           state.config.models.splice(index, 1);
           renderModels();
@@ -646,30 +646,40 @@ const adminHTML = `<!doctype html>
     function updateModel(index, target) {
       const field = target.dataset.field;
       if (!field) return;
-      if (field === 'chain_id') {
-        const model = state.config.models[index];
-        model.chain_id = target.value;
-        if (model.chain_id) {
-          const step = firstChainStep(model.chain_id);
-          if (step) {
-            model.provider_id = step.provider_id;
-            model.upstream_name = step.upstream_name;
-          }
-          model.chain = [];
-        }
-        renderModels();
-      } else {
-        state.config.models[index][field] = target.type === 'checkbox' ? target.checked : target.value;
-      }
+      state.config.models[index][field] = target.type === 'checkbox' ? target.checked : target.value;
     }
 
-    function moveModel(index, delta) {
-      const next = index + delta;
-      if (next < 0 || next >= state.config.models.length) return;
+    function startModelDrag(event, index) {
+      event.currentTarget.closest('tr')?.classList.add('dragging');
+      event.dataTransfer.effectAllowed = 'move';
+      event.dataTransfer.setData('text/plain', String(index));
+    }
+
+    function overModelDrag(event, index) {
+      const from = Number(event.dataTransfer.getData('text/plain'));
+      if (!Number.isInteger(from) || from === index) return;
+      event.preventDefault();
+      event.currentTarget.classList.add('drop-target');
+      event.dataTransfer.dropEffect = 'move';
+    }
+
+    function dropModel(event, index) {
+      event.preventDefault();
+      const from = Number(event.dataTransfer.getData('text/plain'));
+      if (!Number.isInteger(from) || from === index || from < 0 || from >= state.config.models.length) {
+        clearModelDrag();
+        return;
+      }
       const rows = state.config.models;
-      [rows[index], rows[next]] = [rows[next], rows[index]];
+      const [moved] = rows.splice(from, 1);
+      rows.splice(index, 0, moved);
       rows.forEach((m, i) => m.order = i + 1);
+      clearModelDrag();
       renderModels();
+    }
+
+    function clearModelDrag() {
+      document.querySelectorAll('tr.dragging, tr.drop-target').forEach(row => row.classList.remove('dragging', 'drop-target'));
     }
 
     function collectConfig() {
@@ -692,13 +702,6 @@ const adminHTML = `<!doctype html>
       state.config.models.forEach((m, i) => {
         m.public_name = String(m.public_name || '').trim();
         m.chain_id = slug(m.chain_id);
-        if (m.chain_id) {
-          const step = firstChainStep(m.chain_id);
-          if (step) {
-            m.provider_id = step.provider_id;
-            m.upstream_name = step.upstream_name;
-          }
-        }
         m.upstream_name = String(m.upstream_name || m.public_name).trim();
         m.provider_id = slug(m.provider_id);
         m.chain = (m.chain || []).map(step => ({
