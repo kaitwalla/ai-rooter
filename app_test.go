@@ -150,6 +150,64 @@ func TestChainFallsBackOnAnyFourHundredStatus(t *testing.T) {
 	}
 }
 
+func TestNamedChainFallsBackThroughConfiguredSteps(t *testing.T) {
+	var primaryBody, fallbackBody string
+	primary := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		primaryBody = string(body)
+		writeOpenAIError(w, http.StatusForbidden, "forbidden", "no")
+	}))
+	defer primary.Close()
+	fallback := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		fallbackBody = string(body)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":"fallback-ok"}`))
+	}))
+	defer fallback.Close()
+
+	app := testApp(t, Config{
+		PublicAPIKeys: []string{"client-key"},
+		Providers: []Provider{
+			{ID: "ollama", Name: "Ollama", Type: "openai", BaseURL: primary.URL + "/v1", Enabled: true},
+			{ID: "deepseek", Name: "DeepSeek", Type: "openai", BaseURL: fallback.URL + "/v1", Enabled: true},
+		},
+		Chains: []ModelChain{
+			{
+				ID:   "coding",
+				Name: "Coding",
+				Steps: []ChainStep{
+					{ProviderID: "ollama", UpstreamName: "deepseek-v4-flash"},
+					{ProviderID: "deepseek", UpstreamName: "deepseek-v4-flash"},
+				},
+				Order: 1,
+			},
+		},
+		Models: []ModelMapping{
+			{PublicName: "coding", ChainID: "coding", Enabled: true, Order: 1},
+		},
+	})
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"coding","messages":[]}`))
+	req.Header.Set("Authorization", "Bearer client-key")
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	app.routes().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d body = %s", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(primaryBody, `"model":"deepseek-v4-flash"`) {
+		t.Fatalf("primary body = %s", primaryBody)
+	}
+	if !strings.Contains(fallbackBody, `"model":"deepseek-v4-flash"`) {
+		t.Fatalf("fallback body = %s", fallbackBody)
+	}
+	if !strings.Contains(rec.Body.String(), "fallback-ok") {
+		t.Fatalf("response body = %s", rec.Body.String())
+	}
+}
+
 func TestChainDoesNotFallBackOnNonFourHundredStatus(t *testing.T) {
 	fallbackCalled := false
 	primary := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

@@ -253,6 +253,20 @@ func (a *App) handleProxy(w http.ResponseWriter, r *http.Request) {
 		writeOpenAIError(w, http.StatusBadRequest, "invalid_request_error", err.Error())
 		return
 	}
+	if model.ChainID != "" {
+		chain, ok := findConfigChain(cfg.Chains, model.ChainID)
+		if !ok {
+			writeOpenAIError(w, http.StatusBadGateway, "chain_unavailable", fmt.Sprintf("model %q references missing chain %q", publicModel, model.ChainID))
+			return
+		}
+		steps, err := buildChainProviderSteps(cfg, chain.Steps, body)
+		if err != nil {
+			writeOpenAIError(w, http.StatusBadRequest, "invalid_request_error", err.Error())
+			return
+		}
+		a.proxyToChainSteps(w, r, publicModel, steps)
+		return
+	}
 	if len(model.Chain) > 0 {
 		a.proxyToChain(w, r, cfg, model, provider, publicModel, body, rewritten)
 		return
@@ -286,7 +300,30 @@ func (a *App) proxyToChain(w http.ResponseWriter, r *http.Request, cfg Config, m
 			body:         body,
 		})
 	}
+	a.proxyToChainSteps(w, r, publicModel, steps)
+}
 
+func buildChainProviderSteps(cfg Config, chain []ChainStep, original []byte) ([]chainProviderStep, error) {
+	steps := make([]chainProviderStep, 0, len(chain))
+	for _, item := range chain {
+		stepProvider, ok := findProvider(cfg, item.ProviderID)
+		if !ok || !stepProvider.Enabled {
+			continue
+		}
+		body, err := rewriteModelTo(original, item.UpstreamName)
+		if err != nil {
+			return nil, err
+		}
+		steps = append(steps, chainProviderStep{
+			provider:     stepProvider,
+			upstreamName: item.UpstreamName,
+			body:         body,
+		})
+	}
+	return steps, nil
+}
+
+func (a *App) proxyToChainSteps(w http.ResponseWriter, r *http.Request, publicModel string, steps []chainProviderStep) {
 	var firstCooldown *time.Time
 	var last *bufferedResponse
 	for _, step := range steps {

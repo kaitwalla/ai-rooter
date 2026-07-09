@@ -22,6 +22,7 @@ type Config struct {
 	PublicAPIKeys []string       `json:"public_api_keys"`
 	AdminToken    string         `json:"admin_token"`
 	Providers     []Provider     `json:"providers"`
+	Chains        []ModelChain   `json:"chains,omitempty"`
 	Models        []ModelMapping `json:"models"`
 	UpdatedAt     time.Time      `json:"updated_at"`
 }
@@ -39,9 +40,17 @@ type ModelMapping struct {
 	PublicName   string      `json:"public_name"`
 	ProviderID   string      `json:"provider_id"`
 	UpstreamName string      `json:"upstream_name"`
+	ChainID      string      `json:"chain_id,omitempty"`
 	Chain        []ChainStep `json:"chain,omitempty"`
 	Enabled      bool        `json:"enabled"`
 	Order        int         `json:"order"`
+}
+
+type ModelChain struct {
+	ID    string      `json:"id"`
+	Name  string      `json:"name"`
+	Steps []ChainStep `json:"steps"`
+	Order int         `json:"order"`
 }
 
 type ChainStep struct {
@@ -144,6 +153,9 @@ func normalizeConfig(cfg Config) (Config, error) {
 	if cfg.Providers == nil {
 		cfg.Providers = []Provider{}
 	}
+	if cfg.Chains == nil {
+		cfg.Chains = []ModelChain{}
+	}
 	if cfg.Models == nil {
 		cfg.Models = []ModelMapping{}
 	}
@@ -185,14 +197,64 @@ func normalizeConfig(cfg Config) (Config, error) {
 		}
 	}
 
+	chainIDs := map[string]bool{}
+	for i := range cfg.Chains {
+		c := &cfg.Chains[i]
+		c.ID = slugify(c.ID)
+		c.Name = strings.TrimSpace(c.Name)
+		if c.ID == "" {
+			c.ID = slugify(c.Name)
+		}
+		if c.ID == "" {
+			return cfg, fmt.Errorf("chain %d needs an id or name", i+1)
+		}
+		if chainIDs[c.ID] {
+			return cfg, fmt.Errorf("duplicate chain id %q", c.ID)
+		}
+		chainIDs[c.ID] = true
+		if c.Name == "" {
+			c.Name = c.ID
+		}
+		for j := range c.Steps {
+			step := &c.Steps[j]
+			step.ProviderID = slugify(step.ProviderID)
+			step.UpstreamName = strings.TrimSpace(step.UpstreamName)
+			if step.ProviderID == "" || !providerIDs[step.ProviderID] {
+				return cfg, fmt.Errorf("chain %q step %d references unknown provider %q", c.Name, j+1, step.ProviderID)
+			}
+			if step.UpstreamName == "" {
+				return cfg, fmt.Errorf("chain %q step %d needs an upstream model", c.Name, j+1)
+			}
+		}
+	}
+	slices.SortStableFunc(cfg.Chains, func(a, b ModelChain) int {
+		if a.Order == b.Order {
+			return strings.Compare(a.Name, b.Name)
+		}
+		return a.Order - b.Order
+	})
+	for i := range cfg.Chains {
+		cfg.Chains[i].Order = i + 1
+	}
+
 	modelKeys := map[string]bool{}
 	for i := range cfg.Models {
 		m := &cfg.Models[i]
 		m.PublicName = strings.TrimSpace(m.PublicName)
 		m.ProviderID = slugify(m.ProviderID)
 		m.UpstreamName = strings.TrimSpace(m.UpstreamName)
+		m.ChainID = slugify(m.ChainID)
 		if m.PublicName == "" {
 			return cfg, fmt.Errorf("model row %d needs a public name", i+1)
+		}
+		if m.ChainID != "" && !chainIDs[m.ChainID] {
+			return cfg, fmt.Errorf("model %q references unknown chain %q", m.PublicName, m.ChainID)
+		}
+		if m.ChainID != "" && (m.ProviderID == "" || m.UpstreamName == "") {
+			if chain, ok := findConfigChain(cfg.Chains, m.ChainID); ok && len(chain.Steps) > 0 {
+				m.ProviderID = chain.Steps[0].ProviderID
+				m.UpstreamName = chain.Steps[0].UpstreamName
+			}
 		}
 		if m.ProviderID == "" || !providerIDs[m.ProviderID] {
 			return cfg, fmt.Errorf("model %q references unknown provider %q", m.PublicName, m.ProviderID)
@@ -292,11 +354,25 @@ func cloneConfig(cfg Config) Config {
 	out := cfg
 	out.PublicAPIKeys = slices.Clone(cfg.PublicAPIKeys)
 	out.Providers = slices.Clone(cfg.Providers)
+	out.Chains = slices.Clone(cfg.Chains)
+	for i := range out.Chains {
+		out.Chains[i].Steps = slices.Clone(cfg.Chains[i].Steps)
+	}
 	out.Models = slices.Clone(cfg.Models)
 	for i := range out.Models {
 		out.Models[i].Chain = slices.Clone(cfg.Models[i].Chain)
 	}
 	return out
+}
+
+func findConfigChain(chains []ModelChain, id string) (ModelChain, bool) {
+	id = slugify(id)
+	for _, chain := range chains {
+		if chain.ID == id {
+			return chain, true
+		}
+	}
+	return ModelChain{}, false
 }
 
 func compactUnique(values []string) []string {

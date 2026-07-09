@@ -71,6 +71,7 @@ const adminHTML = `<!doctype html>
     textarea { min-height: 92px; resize: vertical; overflow-wrap: anywhere; }
     table { width: 100%; border-collapse: collapse; }
     .models-table { min-width: 760px; table-layout: fixed; }
+    .chains-table { min-width: 520px; table-layout: fixed; }
     th, td { border-bottom: 1px solid var(--line); padding: 8px; text-align: left; vertical-align: middle; }
     th { color: var(--muted); font-weight: 600; font-size: 12px; }
     td input, td select { min-width: 0; }
@@ -212,6 +213,25 @@ const adminHTML = `<!doctype html>
           <button id="activateBtn">Activate</button>
         </div>
       </section>
+      <section>
+        <div class="toolbar">
+          <h2>Model chains</h2>
+          <button id="addChainBtn">Add chain</button>
+        </div>
+        <div class="muted">Steps use configured provider/model pairs, including models that are not shown publicly.</div>
+        <div class="scroll">
+          <table class="chains-table">
+            <thead>
+              <tr>
+                <th>Name</th>
+                <th>Steps</th>
+                <th style="width:54px;"></th>
+              </tr>
+            </thead>
+            <tbody id="chains"></tbody>
+          </table>
+        </div>
+      </section>
     </div>
     <section>
       <div class="toolbar">
@@ -234,7 +254,7 @@ const adminHTML = `<!doctype html>
               <th>Public name</th>
               <th>Provider</th>
               <th>Upstream model</th>
-              <th>Chain fallback</th>
+              <th>Model chain</th>
               <th style="width:140px;">Order</th>
               <th style="width:54px;"></th>
             </tr>
@@ -255,6 +275,7 @@ const adminHTML = `<!doctype html>
       adminToken: document.getElementById('adminToken'),
       publicKeys: document.getElementById('publicKeys'),
       providers: document.getElementById('providers'),
+      chains: document.getElementById('chains'),
       models: document.getElementById('models'),
       modelFilter: document.getElementById('modelFilter'),
       activateProvider: document.getElementById('activateProvider'),
@@ -313,19 +334,54 @@ const adminHTML = `<!doctype html>
       return provider ? (provider.name || provider.id) : id;
     }
 
-    function chainToText(chain) {
-      return (chain || []).map(step => (step.provider_id || '') + '/' + (step.upstream_name || '')).join('\n');
+    function chainName(id) {
+      const chain = (state.config.chains || []).find(c => c.id === id);
+      return chain ? (chain.name || chain.id) : id;
     }
 
-    function parseChain(value) {
-      return String(value || '').split(/\n+/).map(v => v.trim()).filter(Boolean).map(line => {
-        const slash = line.indexOf('/');
-        if (slash < 0) return { provider_id: '', upstream_name: line };
-        return {
-          provider_id: slug(line.slice(0, slash)),
-          upstream_name: line.slice(slash + 1).trim()
-        };
+    function chainOptions(selected) {
+      return '<option value="">Direct model</option>' + (state.config.chains || []).map(c =>
+        '<option value="' + escapeHTML(c.id) + '"' + (c.id === selected ? ' selected' : '') + '>' + escapeHTML(c.name || c.id) + '</option>'
+      ).join('');
+    }
+
+    function modelValue(providerID, upstreamName) {
+      return providerID + '|' + encodeURIComponent(upstreamName || '');
+    }
+
+    function parseModelValue(value) {
+      const split = String(value || '').indexOf('|');
+      if (split < 0) return { provider_id: '', upstream_name: '' };
+      return {
+        provider_id: slug(value.slice(0, split)),
+        upstream_name: decodeURIComponent(value.slice(split + 1))
+      };
+    }
+
+    function configuredModelOptions(selectedStep) {
+      const hasSelected = !!(selectedStep?.provider_id && selectedStep?.upstream_name);
+      const selected = hasSelected ? modelValue(selectedStep.provider_id, selectedStep.upstream_name) : '';
+      const seen = new Set();
+      const options = [];
+      state.config.models.forEach(m => {
+        const providerID = slug(m.provider_id);
+        const upstreamName = String(m.upstream_name || '').trim();
+        if (!providerID || !upstreamName) return;
+        const value = modelValue(providerID, upstreamName);
+        if (seen.has(value)) return;
+        seen.add(value);
+        const visibility = m.enabled ? '' : ' (not shown)';
+        options.push('<option value="' + escapeHTML(value) + '"' + (value === selected ? ' selected' : '') + '>' + escapeHTML(providerName(providerID) + ' / ' + upstreamName + visibility) + '</option>');
       });
+      if (hasSelected && !seen.has(selected)) {
+        options.unshift('<option value="' + escapeHTML(selected) + '" selected>' + escapeHTML(providerName(selectedStep.provider_id) + ' / ' + selectedStep.upstream_name) + '</option>');
+      }
+      return '<option value="">Select model</option>' + options.join('');
+    }
+
+    function firstChainStep(chainID) {
+      const chain = (state.config.chains || []).find(c => c.id === chainID);
+      return chain?.steps?.[0] || null;
     }
 
     function keyFingerprint(value) {
@@ -352,6 +408,17 @@ const adminHTML = `<!doctype html>
       return candidate;
     }
 
+    function uniqueChainID(base) {
+      const existing = new Set((state.config.chains || []).map(c => c.id));
+      let candidate = slug(base) || 'chain';
+      let n = 2;
+      while (existing.has(candidate)) {
+        candidate = (slug(base) || 'chain') + '-' + n;
+        n++;
+      }
+      return candidate;
+    }
+
     function defaultBaseURL(type) {
       if (type === 'ollama_cloud') return 'https://ollama.com/api';
       if (type === 'ollama') return 'http://localhost:11434/api';
@@ -363,6 +430,7 @@ const adminHTML = `<!doctype html>
     }
 
     function hydrateForm() {
+      state.config.chains = state.config.chains || [];
       els.authPrompt.style.display = 'none';
       els.mainActions.style.display = 'flex';
       setAuthStatus('');
@@ -370,6 +438,7 @@ const adminHTML = `<!doctype html>
       els.publicKeys.value = (state.config.public_api_keys || []).join('\n');
       els.activateProvider.innerHTML = providerOptions(els.activateProvider.value);
       renderProviders();
+      renderChains();
       renderModels();
     }
 
@@ -451,6 +520,7 @@ const adminHTML = `<!doctype html>
           state.config.providers.splice(index, 1);
           state.config.models = state.config.models.filter(m => m.provider_id !== id);
           state.config.models.forEach(m => { m.chain = (m.chain || []).filter(step => step.provider_id !== id); });
+          state.config.chains.forEach(c => { c.steps = (c.steps || []).filter(step => step.provider_id !== id); });
           if (state.editingProviderID === id) state.editingProviderID = '';
           hydrateForm();
         });
@@ -473,11 +543,72 @@ const adminHTML = `<!doctype html>
       if (field === 'id') {
         state.config.models.forEach(m => { if (m.provider_id === oldID) m.provider_id = slug(value); });
         state.config.models.forEach(m => (m.chain || []).forEach(step => { if (step.provider_id === oldID) step.provider_id = slug(value); }));
+        state.config.chains.forEach(c => (c.steps || []).forEach(step => { if (step.provider_id === oldID) step.provider_id = slug(value); }));
         state.config.providers[index].id = slug(value);
         state.editingProviderID = state.config.providers[index].id;
         els.activateProvider.innerHTML = providerOptions(els.activateProvider.value);
+        renderChains();
         renderModels();
       }
+    }
+
+    function renderChains() {
+      els.chains.innerHTML = '';
+      state.config.chains.sort((a, b) => (a.order || 0) - (b.order || 0)).forEach((chain, index) => {
+        chain.order = index + 1;
+        chain.steps = chain.steps || [];
+        const tr = document.createElement('tr');
+        const stepRows = chain.steps.map((step, stepIndex) =>
+          '<div class="field-row" style="margin-bottom:6px;">' +
+          '<select data-field="chain_step" data-step="' + stepIndex + '">' + configuredModelOptions(step) + '</select>' +
+          '<button class="icon" data-action="remove-step" data-step="' + stepIndex + '" title="Remove step">×</button>' +
+          '</div>'
+        ).join('');
+        tr.innerHTML =
+          '<td><input data-field="name" value="' + escapeHTML(chain.name || '') + '" placeholder="Coding"></td>' +
+          '<td>' + stepRows + '<button data-action="add-step">Add step</button></td>' +
+          '<td><button class="danger icon" data-action="delete" title="Delete">×</button></td>';
+        tr.addEventListener('input', e => updateChain(index, e.target));
+        tr.addEventListener('change', e => updateChain(index, e.target));
+        tr.querySelector('[data-action="add-step"]').addEventListener('click', () => {
+          const first = state.config.models.find(m => m.provider_id && m.upstream_name);
+          chain.steps.push(first ? { provider_id: first.provider_id, upstream_name: first.upstream_name } : { provider_id: '', upstream_name: '' });
+          renderChains();
+        });
+        tr.querySelectorAll('[data-action="remove-step"]').forEach(button => {
+          button.addEventListener('click', () => {
+            chain.steps.splice(Number(button.dataset.step), 1);
+            renderChains();
+          });
+        });
+        tr.querySelector('[data-action="delete"]').addEventListener('click', () => {
+          const id = state.config.chains[index].id;
+          state.config.chains.splice(index, 1);
+          state.config.models.forEach(m => { if (m.chain_id === id) m.chain_id = ''; });
+          renderChains();
+          renderModels();
+        });
+        els.chains.appendChild(tr);
+      });
+    }
+
+    function updateChain(index, target) {
+      const field = target.dataset.field;
+      if (!field) return;
+      const chain = state.config.chains[index];
+      if (field === 'chain_step') {
+        chain.steps[Number(target.dataset.step)] = parseModelValue(target.value);
+      } else {
+        chain[field] = target.value;
+        if (field === 'name') {
+          const oldID = chain.id;
+          chain.id = slug(chain.id || target.value);
+          if (oldID && oldID !== chain.id) {
+            state.config.models.forEach(m => { if (m.chain_id === oldID) m.chain_id = chain.id; });
+          }
+        }
+      }
+      renderModels();
     }
 
     function renderModels() {
@@ -485,16 +616,19 @@ const adminHTML = `<!doctype html>
       els.models.innerHTML = '';
       state.config.models.sort((a, b) => (a.order || 0) - (b.order || 0)).forEach((m, index) => {
         m.order = index + 1;
-        const chainText = chainToText(m.chain);
-        const text = [m.public_name, m.upstream_name, m.provider_id, providerName(m.provider_id), chainText].join(' ').toLowerCase();
+        const selectedChain = m.chain_id || '';
+        const firstStep = selectedChain ? firstChainStep(selectedChain) : null;
+        const providerLabel = firstStep ? providerName(firstStep.provider_id) : providerName(m.provider_id);
+        const upstreamLabel = firstStep ? firstStep.upstream_name : m.upstream_name;
+        const text = [m.public_name, upstreamLabel, providerLabel, selectedChain, chainName(selectedChain)].join(' ').toLowerCase();
         if (filter && !text.includes(filter)) return;
         const tr = document.createElement('tr');
         tr.innerHTML =
           '<td><input class="checkbox" data-field="enabled" type="checkbox" ' + (m.enabled ? 'checked' : '') + '></td>' +
           '<td><input data-field="public_name" value="' + escapeHTML(m.public_name) + '"></td>' +
-          '<td><span class="pill">' + escapeHTML(providerName(m.provider_id)) + '</span></td>' +
-          '<td><input data-field="upstream_name" value="' + escapeHTML(m.upstream_name) + '"></td>' +
-          '<td><textarea data-field="chain" rows="2" spellcheck="false" placeholder="provider-id/upstream-model">' + escapeHTML(chainText) + '</textarea></td>' +
+          '<td><span class="pill">' + escapeHTML(providerLabel) + '</span></td>' +
+          '<td><input data-field="upstream_name" value="' + escapeHTML(upstreamLabel || '') + '"' + (selectedChain ? ' disabled' : '') + '></td>' +
+          '<td><select data-field="chain_id">' + chainOptions(selectedChain) + '</select></td>' +
           '<td><button class="icon" data-action="up" title="Move up">↑</button> <button class="icon" data-action="down" title="Move down">↓</button></td>' +
           '<td><button class="danger icon" data-action="delete" title="Delete">×</button></td>';
         tr.addEventListener('input', e => updateModel(index, e.target));
@@ -512,8 +646,18 @@ const adminHTML = `<!doctype html>
     function updateModel(index, target) {
       const field = target.dataset.field;
       if (!field) return;
-      if (field === 'chain') {
-        state.config.models[index].chain = parseChain(target.value);
+      if (field === 'chain_id') {
+        const model = state.config.models[index];
+        model.chain_id = target.value;
+        if (model.chain_id) {
+          const step = firstChainStep(model.chain_id);
+          if (step) {
+            model.provider_id = step.provider_id;
+            model.upstream_name = step.upstream_name;
+          }
+          model.chain = [];
+        }
+        renderModels();
       } else {
         state.config.models[index][field] = target.type === 'checkbox' ? target.checked : target.value;
       }
@@ -536,8 +680,25 @@ const adminHTML = `<!doctype html>
         p.name = String(p.name || p.id).trim();
         p.base_url = String(p.base_url || '').trim().replace(/\/+$/, '');
       });
+      state.config.chains = (state.config.chains || []).map((c, i) => ({
+        id: slug(c.id || c.name),
+        name: String(c.name || c.id).trim(),
+        steps: (c.steps || []).map(step => ({
+          provider_id: slug(step.provider_id),
+          upstream_name: String(step.upstream_name || '').trim()
+        })).filter(step => step.provider_id && step.upstream_name),
+        order: i + 1
+      }));
       state.config.models.forEach((m, i) => {
         m.public_name = String(m.public_name || '').trim();
+        m.chain_id = slug(m.chain_id);
+        if (m.chain_id) {
+          const step = firstChainStep(m.chain_id);
+          if (step) {
+            m.provider_id = step.provider_id;
+            m.upstream_name = step.upstream_name;
+          }
+        }
         m.upstream_name = String(m.upstream_name || m.public_name).trim();
         m.provider_id = slug(m.provider_id);
         m.chain = (m.chain || []).map(step => ({
@@ -602,6 +763,7 @@ const adminHTML = `<!doctype html>
           });
           added++;
         });
+        renderChains();
         renderModels();
         setStatus('Discovered ' + result.models.length + ' models from ' + providerName(providerID) + '; added ' + added + ', skipped ' + skipped, 'ok');
       } catch (err) {
@@ -666,6 +828,18 @@ const adminHTML = `<!doctype html>
       state.config.providers.push({ id, name: '', type: 'openai', base_url: '', api_key: '', enabled: true });
       state.editingProviderID = id;
       hydrateForm();
+    });
+    document.getElementById('addChainBtn').addEventListener('click', () => {
+      const name = 'Chain ' + ((state.config.chains || []).length + 1);
+      const first = state.config.models.find(m => m.provider_id && m.upstream_name);
+      state.config.chains.push({
+        id: uniqueChainID(name),
+        name,
+        steps: first ? [{ provider_id: first.provider_id, upstream_name: first.upstream_name }] : [],
+        order: state.config.chains.length + 1
+      });
+      renderChains();
+      renderModels();
     });
     document.getElementById('addModelBtn').addEventListener('click', () => {
       const provider = els.activateProvider.value || state.config.providers[0]?.id || '';

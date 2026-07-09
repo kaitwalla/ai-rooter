@@ -87,7 +87,9 @@ Rooter does not pass client API keys through. Clients authenticate to Rooter wit
 
 ## Model chains
 
-A visible model can have chain fallback steps. Clients still see and request one regular public model name; Rooter tries the row's primary provider/model first, then each configured chain step if the upstream returns any `4xx` response.
+Model chains are named ordered lists of provider/model steps. In the admin UI, create a chain such as `Coding`, choose each step from configured provider/upstream model dropdowns, then assign that chain to a visible public model. Chain step dropdowns include configured models even when they are not enabled in `/v1/models`.
+
+Clients still see and request one regular public model name. For a chain-backed model, Rooter tries each configured chain step in order if the upstream returns any `4xx` response. Older configs with inline per-model fallback steps continue to work.
 
 `429` responses also put that provider/model step on cooldown. Rooter uses `Retry-After` when present, and otherwise waits 30 minutes before trying that step again. Non-`4xx` responses, including upstream `5xx` errors, are returned without falling through the chain.
 
