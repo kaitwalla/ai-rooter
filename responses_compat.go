@@ -36,6 +36,10 @@ func roundTripResponsesCompat(base http.RoundTripper, req *http.Request) (*http.
 	if err != nil {
 		return jsonTransportError(req, http.StatusBadRequest, "invalid_request_error", err.Error()), nil
 	}
+	chatBody, err = normalizeProviderChatRequest(req.URL.Hostname(), chatBody)
+	if err != nil {
+		return jsonTransportError(req, http.StatusBadRequest, "invalid_request_error", err.Error()), nil
+	}
 
 	clone := req.Clone(req.Context())
 	urlCopy := *clone.URL
