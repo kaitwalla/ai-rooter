@@ -38,7 +38,8 @@ func roundTripResponsesCompat(base http.RoundTripper, req *http.Request) (*http.
 	}
 
 	clone := req.Clone(req.Context())
-	clone.URL = clone.URL.Clone()
+	urlCopy := *clone.URL
+	clone.URL = &urlCopy
 	clone.URL.Path = responsesPathToChat(clone.URL.Path)
 	clone.Header = req.Header.Clone()
 	clone.Body = io.NopCloser(bytes.NewReader(chatBody))
