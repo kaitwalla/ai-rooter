@@ -22,6 +22,8 @@ func (a *App) proxyToOllama(w http.ResponseWriter, r *http.Request, provider Pro
 	switch r.URL.Path {
 	case "/v1/chat/completions":
 		a.handleOllamaChat(w, r, provider, publicModel, body)
+	case "/v1/responses":
+		a.proxyOllamaResponses(w, r, provider, body)
 	case "/v1/completions":
 		a.handleOllamaCompletion(w, r, provider, publicModel, body)
 	case "/v1/embeddings":
