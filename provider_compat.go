@@ -22,7 +22,13 @@ type providerCompatibilityTransport struct {
 }
 
 func (t *providerCompatibilityTransport) RoundTrip(req *http.Request) (*http.Response, error) {
-	if req.Method != http.MethodPost || req.Body == nil || !isChatRequestPath(req.URL.Path) {
+	if req.Method != http.MethodPost || req.Body == nil {
+		return t.base.RoundTrip(req)
+	}
+	if isResponsesRequestPath(req.URL.Path) {
+		return roundTripResponsesCompat(t.base, req)
+	}
+	if !isChatRequestPath(req.URL.Path) {
 		return t.base.RoundTrip(req)
 	}
 
