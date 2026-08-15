@@ -40,6 +40,7 @@ func (a *App) routes() http.Handler {
 	mux.HandleFunc("/admin/api/config", a.requireAdmin(a.handleAdminConfig))
 	mux.HandleFunc("/admin/api/activate", a.requireAdmin(a.handleActivate))
 	mux.HandleFunc("/admin/api/discover", a.requireAdmin(a.handleDiscover))
+	a.registerAdminAPI(mux)
 	mux.HandleFunc("/healthz", a.handleHealth)
 	mux.HandleFunc("/v1/models", a.handleModels)
 	mux.HandleFunc("/v1/models/", a.handleModel)
