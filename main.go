@@ -43,14 +43,13 @@ func main() {
 
 	store, err := NewStore(*configPath)
 	if err != nil { log.Fatalf("config: %v", err) }
-	store.EnableScopedAuthBridge()
 
 	app := NewApp(store, os.Getenv("ROOTER_ADMIN_TOKEN"))
 	timeout, err := rooterUpstreamTimeout(os.Getenv("ROOTER_UPSTREAM_TIMEOUT"))
 	if err != nil { log.Fatalf("ROOTER_UPSTREAM_TIMEOUT: %v", err) }
 	app.client.Timeout = timeout
 
-	handler := sseFlushMiddleware(app.scopedAuthMiddleware(app.routes()))
+	handler := sseFlushMiddleware(app.routes())
 	server := &http.Server{Addr:*addr, Handler:handler}
 
 	log.Printf("rooter listening on %s", *addr)
