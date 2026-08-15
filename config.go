@@ -58,7 +58,8 @@ type Store struct { path string; mu sync.RWMutex; cfg Config; scopedBridge bool 
 
 func NewStore(path string) (*Store,error) { s:=&Store{path:path}; if err:=s.load();err!=nil{return nil,err}; return s,nil }
 func (s *Store) EnableScopedAuthBridge(){s.mu.Lock();s.scopedBridge=true;s.mu.Unlock()}
-func (s *Store) Snapshot() Config { s.mu.RLock(); defer s.mu.RUnlock(); out:=cloneConfig(s.cfg); if s.scopedBridge { out.PublicAPIKeys=[]string{internalPublicAuthSentinel}; out.AdminToken=internalAdminAuthSentinel }; return out }
+func (s *Store) ScopedAuthBridgeEnabled() bool { s.mu.RLock(); defer s.mu.RUnlock(); return s.scopedBridge }
+func (s *Store) Snapshot() Config { s.mu.RLock(); defer s.mu.RUnlock(); return cloneConfig(s.cfg) }
 func (s *Store) Replace(next Config) error { normalized,err:=normalizeConfig(next);if err!=nil{return err}; normalized.UpdatedAt=time.Now().UTC(); s.mu.Lock();defer s.mu.Unlock();if err:=writeConfigAtomic(s.path,normalized);err!=nil{return err};s.cfg=normalized;return nil }
 
 func (s *Store) load() error {
@@ -75,7 +76,7 @@ func normalizeConfig(cfg Config)(Config,error){
 }
 
 func migrateLegacyCredentials(cfg *Config){now:=time.Now().UTC();for i,raw:=range cfg.PublicAPIKeys{raw=strings.TrimSpace(raw);if raw==""||raw==internalPublicAuthSentinel{continue};appendMigratedAPIKey(cfg,raw,fmt.Sprintf("Migrated API key %d",i+1),publicAPIPermissions(),now)};if raw:=strings.TrimSpace(cfg.AdminToken);raw!=""&&raw!=internalAdminAuthSentinel{appendMigratedAPIKey(cfg,raw,"Migrated admin key",allAPIPermissions(),now)}}
-func appendMigratedAPIKey(cfg *Config,raw,name string,permissions []string,now time.Time){hash:=hashAPIKey(raw);for _,k:=range cfg.APIKeys{if k.Hash==hash{return}};prefix:=raw;if len(prefix)>12{prefix=prefix[:12]};cfg.APIKeys=append(cfg.APIKeys,APIKey{ID:fmt.Sprintf("migrated-%s",hash[:12]),Name:name,Prefix:prefix,Hash:hash,Permissions:permissions,Enabled:true,CreatedAt:now})}
+func appendMigratedAPIKey(cfg *Config,raw,name string,permissions []string,now time.Time){hash:=hashAPIKey(raw);for _,k:=range cfg.APIKeys{if k.Hash==hash{return}};cfg.APIKeys=append(cfg.APIKeys,APIKey{ID:fmt.Sprintf("migrated-%s",hash[:12]),Name:name,Prefix:"legacy",Hash:hash,Permissions:permissions,Enabled:true,CreatedAt:now})}
 func hashAPIKey(raw string)string{sum:=sha256.Sum256([]byte(raw));return hex.EncodeToString(sum[:])}
 func generateAdminToken()string{return generateRawAPIKey()}
 func generateRawAPIKey()string{var b [32]byte;if _,err:=rand.Read(b[:]);err!=nil{panic(fmt.Sprintf("generate API key: %v",err))};return "rtk_"+hex.EncodeToString(b[:])}
