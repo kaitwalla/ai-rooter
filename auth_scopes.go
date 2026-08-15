@@ -72,7 +72,13 @@ func (a *App) scopedAuthMiddleware(next http.Handler) http.Handler {
 			return
 		}
 		if a.adminTokenEnv != "" && subtle.ConstantTimeCompare([]byte(raw), []byte(a.adminTokenEnv)) == 1 {
-			a.rewriteLegacyAuthHeader(r)
+			// Admin endpoints still pass through the legacy requireAdmin guard.
+			// Keep the real environment token on those requests so that guard can
+			// validate it. Public /v1 endpoints still need the internal sentinel
+			// because their legacy guard only understands persisted public keys.
+			if strings.HasPrefix(r.URL.Path, "/v1/") {
+				a.rewriteLegacyAuthHeader(r)
+			}
 			a.dispatchScopedEndpoint(w, r, next)
 			return
 		}
