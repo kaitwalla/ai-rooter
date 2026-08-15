@@ -59,7 +59,7 @@ type Store struct { path string; mu sync.RWMutex; cfg Config; scopedBridge bool 
 func NewStore(path string) (*Store,error) { s:=&Store{path:path}; if err:=s.load();err!=nil{return nil,err}; return s,nil }
 func (s *Store) EnableScopedAuthBridge(){s.mu.Lock();s.scopedBridge=true;s.mu.Unlock()}
 func (s *Store) ScopedAuthBridgeEnabled() bool { s.mu.RLock(); defer s.mu.RUnlock(); return s.scopedBridge }
-func (s *Store) Snapshot() Config { s.mu.RLock(); defer s.mu.RUnlock(); return cloneConfig(s.cfg) }
+func (s *Store) Snapshot() Config { s.mu.RLock(); defer s.mu.RUnlock(); out:=cloneConfig(s.cfg); if s.scopedBridge { out.PublicAPIKeys=[]string{internalPublicAuthSentinel} }; return out }
 func (s *Store) Replace(next Config) error { normalized,err:=normalizeConfig(next);if err!=nil{return err}; normalized.UpdatedAt=time.Now().UTC(); s.mu.Lock();defer s.mu.Unlock();if err:=writeConfigAtomic(s.path,normalized);err!=nil{return err};s.cfg=normalized;return nil }
 
 func (s *Store) load() error {
