@@ -22,6 +22,8 @@ func (a *App) proxyToOllama(w http.ResponseWriter, r *http.Request, provider Pro
 	switch r.URL.Path {
 	case "/v1/chat/completions":
 		a.handleOllamaChat(w, r, provider, publicModel, body)
+	case "/v1/responses":
+		a.proxyOllamaResponses(w, r, provider, body)
 	case "/v1/completions":
 		a.handleOllamaCompletion(w, r, provider, publicModel, body)
 	case "/v1/embeddings":
@@ -38,7 +40,8 @@ func (a *App) handleOllamaChat(w http.ResponseWriter, r *http.Request, provider 
 		return
 	}
 	reqBody := map[string]any{}
-	copyJSONFields(reqBody, in, "model", "messages", "tools", "format", "keep_alive", "logprobs", "top_logprobs")
+	copyJSONFields(reqBody, in, "model", "tools", "format", "keep_alive", "logprobs", "top_logprobs")
+	copyOllamaMessages(reqBody, in)
 	copyOpenAIResponseFormat(reqBody, in)
 	copyThinking(reqBody, in)
 	copyOptions(reqBody, in)
@@ -64,19 +67,30 @@ func (a *App) handleOllamaChat(w http.ResponseWriter, r *http.Request, provider 
 		writeOpenAIError(w, http.StatusBadGateway, "upstream_decode_error", err.Error())
 		return
 	}
+	toolCalls := openAIToolCalls(out.Message.ToolCalls, nil)
+	message := map[string]any{
+		"role":    "assistant",
+		"content": out.Message.Content,
+	}
+	if out.Message.Thinking != "" {
+		message["reasoning"] = out.Message.Thinking
+	}
+	if len(toolCalls) > 0 {
+		message["tool_calls"] = toolCalls
+	}
+	finish := finishReason(out.DoneReason)
+	if len(toolCalls) > 0 {
+		finish = "tool_calls"
+	}
 	writeJSON(w, http.StatusOK, map[string]any{
 		"id":      "chatcmpl-" + randomID(),
 		"object":  "chat.completion",
 		"created": createdUnix(out.CreatedAt),
 		"model":   publicModel,
 		"choices": []map[string]any{{
-			"index": 0,
-			"message": map[string]any{
-				"role":       "assistant",
-				"content":    out.Message.Content,
-				"tool_calls": out.Message.ToolCalls,
-			},
-			"finish_reason": finishReason(out.DoneReason),
+			"index":         0,
+			"message":       message,
+			"finish_reason": finish,
 		}},
 		"usage": usageObject(out.PromptEvalCount, out.EvalCount),
 	})
@@ -260,14 +274,34 @@ func streamOllamaChatAsOpenAI(w http.ResponseWriter, body io.Reader, publicModel
 	flusher, _ := w.(http.Flusher)
 	scanner := bufio.NewScanner(body)
 	scanner.Buffer(make([]byte, 0, 64*1024), 4*1024*1024)
+	toolCallSent := false
+	toolCallIDs := map[int]string{}
 	for scanner.Scan() {
 		var item ollamaChatResponse
 		if err := json.Unmarshal(scanner.Bytes(), &item); err != nil {
 			continue
 		}
+		toolCalls := openAIToolCalls(item.Message.ToolCalls, toolCallIDs)
+		if len(toolCalls) > 0 {
+			toolCallSent = true
+		}
 		finish := any(nil)
 		if item.Done {
-			finish = finishReason(item.DoneReason)
+			if toolCallSent {
+				finish = "tool_calls"
+			} else {
+				finish = finishReason(item.DoneReason)
+			}
+		}
+		delta := map[string]any{
+			"role":    "assistant",
+			"content": item.Message.Content,
+		}
+		if item.Message.Thinking != "" {
+			delta["reasoning"] = item.Message.Thinking
+		}
+		if len(toolCalls) > 0 {
+			delta["tool_calls"] = toolCalls
 		}
 		chunk := map[string]any{
 			"id":      "chatcmpl-" + randomID(),
@@ -276,7 +310,7 @@ func streamOllamaChatAsOpenAI(w http.ResponseWriter, body io.Reader, publicModel
 			"model":   publicModel,
 			"choices": []map[string]any{{
 				"index":         0,
-				"delta":         map[string]any{"content": item.Message.Content},
+				"delta":         delta,
 				"finish_reason": finish,
 			}},
 		}
@@ -344,6 +378,112 @@ func copyJSONFields(dst map[string]any, src map[string]json.RawMessage, fields .
 			dst[field] = mustRaw(raw)
 		}
 	}
+}
+
+func copyOllamaMessages(dst map[string]any, src map[string]json.RawMessage) {
+	raw, ok := src["messages"]
+	if !ok {
+		return
+	}
+	var messages []map[string]any
+	if err := json.Unmarshal(raw, &messages); err != nil {
+		dst["messages"] = mustRaw(raw)
+		return
+	}
+	toolNames := map[string]string{}
+	for _, message := range messages {
+		if reasoning, ok := message["reasoning"]; ok {
+			if _, exists := message["thinking"]; !exists {
+				message["thinking"] = reasoning
+			}
+			delete(message, "reasoning")
+		}
+		if calls, ok := message["tool_calls"].([]any); ok {
+			for _, value := range calls {
+				call, ok := value.(map[string]any)
+				if !ok {
+					continue
+				}
+				function, ok := call["function"].(map[string]any)
+				if !ok {
+					continue
+				}
+				if arguments, ok := function["arguments"].(string); ok {
+					var decoded any
+					if json.Unmarshal([]byte(arguments), &decoded) == nil {
+						function["arguments"] = decoded
+					}
+				}
+				id, _ := call["id"].(string)
+				name, _ := function["name"].(string)
+				if id != "" && name != "" {
+					toolNames[id] = name
+				}
+				delete(call, "type")
+				delete(call, "index")
+			}
+		}
+		role, _ := message["role"].(string)
+		if strings.EqualFold(role, "tool") {
+			if _, exists := message["tool_name"]; !exists {
+				if name, ok := message["name"].(string); ok && name != "" {
+					message["tool_name"] = name
+				} else if id, ok := message["tool_call_id"].(string); ok {
+					if name := toolNames[id]; name != "" {
+						message["tool_name"] = name
+					}
+				}
+			}
+		}
+	}
+	dst["messages"] = messages
+}
+
+func openAIToolCalls(calls []ollamaToolCall, ids map[int]string) []map[string]any {
+	if len(calls) == 0 {
+		return nil
+	}
+	result := make([]map[string]any, 0, len(calls))
+	for i, call := range calls {
+		index := i
+		if call.Function.Index != nil {
+			index = *call.Function.Index
+		}
+		id := call.ID
+		if id == "" && ids != nil {
+			id = ids[index]
+		}
+		if id == "" {
+			id = "call_" + randomID()
+			if ids != nil {
+				ids[index] = id
+			}
+		}
+		result = append(result, map[string]any{
+			"id":    id,
+			"index": index,
+			"type":  "function",
+			"function": map[string]any{
+				"name":      call.Function.Name,
+				"arguments": openAIToolArguments(call.Function.Arguments),
+			},
+		})
+	}
+	return result
+}
+
+func openAIToolArguments(raw json.RawMessage) string {
+	if len(raw) == 0 {
+		return "{}"
+	}
+	var encoded string
+	if json.Unmarshal(raw, &encoded) == nil {
+		return encoded
+	}
+	if json.Valid(raw) {
+		return string(raw)
+	}
+	return "{}"
 }
 
 func copyOptions(dst map[string]any, src map[string]json.RawMessage) {
@@ -475,13 +615,23 @@ func randomID() string {
 	return strconv.FormatInt(time.Now().UnixNano(), 36)
 }
 
+type ollamaToolCall struct {
+	ID       string `json:"id,omitempty"`
+	Function struct {
+		Index     *int            `json:"index,omitempty"`
+		Name      string          `json:"name"`
+		Arguments json.RawMessage `json:"arguments"`
+	} `json:"function"`
+}
+
 type ollamaChatResponse struct {
 	Model     string `json:"model"`
 	CreatedAt string `json:"created_at"`
 	Message   struct {
-		Role      string `json:"role"`
-		Content   string `json:"content"`
-		ToolCalls any    `json:"tool_calls,omitempty"`
+		Role      string           `json:"role"`
+		Content   string           `json:"content"`
+		Thinking  string           `json:"thinking,omitempty"`
+		ToolCalls []ollamaToolCall `json:"tool_calls,omitempty"`
 	} `json:"message"`
 	Done            bool   `json:"done"`
 	DoneReason      string `json:"done_reason"`
