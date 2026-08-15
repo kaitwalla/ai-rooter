@@ -544,6 +544,7 @@ func testApp(t *testing.T, cfg Config) *App {
 	t.Helper()
 	if strings.TrimSpace(cfg.AdminToken) == "" { cfg.AdminToken = "test-admin-key" }
 	if strings.TrimSpace(cfg.AdminToken) == "" { cfg.AdminToken = "test-admin-key" }
+	if strings.TrimSpace(cfg.AdminToken) == "" { cfg.AdminToken = "test-admin-key" }
 	dir := t.TempDir()
 	path := filepath.Join(dir, "config.json")
 	normalized, err := normalizeConfig(cfg)
