@@ -182,29 +182,24 @@ func (a *App) authenticateScopedKey(raw string) (APIKey, bool) {
 }
 func (a *App) touchAPIKey(id string) {
 	a.store.mu.Lock()
-	shouldUpdate := true
-	for _, k := range a.store.cfg.APIKeys {
-		if k.ID == id {
-			if k.LastUsedAt != nil && time.Since(*k.LastUsedAt) < 15*time.Minute {
-				shouldUpdate = false
-			}
-			break
+	defer a.store.mu.Unlock()
+
+	next := cloneConfig(a.store.cfg)
+	now := time.Now().UTC()
+	for i := range next.APIKeys {
+		if next.APIKeys[i].ID != id {
+			continue
 		}
-	}
-	if !shouldUpdate {
-		a.store.mu.Unlock()
+		if next.APIKeys[i].LastUsedAt != nil && now.Sub(*next.APIKeys[i].LastUsedAt) < 15*time.Minute {
+			return
+		}
+		next.APIKeys[i].LastUsedAt = &now
+		next.UpdatedAt = now
+		if err := writeConfigAtomic(a.store.path, next); err == nil {
+			a.store.cfg = next
+		}
 		return
 	}
-	now := time.Now().UTC()
-	for i := range a.store.cfg.APIKeys {
-		if a.store.cfg.APIKeys[i].ID == id {
-			a.store.cfg.APIKeys[i].LastUsedAt = &now
-			break
-		}
-	}
-	cfg := cloneConfig(a.store.cfg)
-	a.store.mu.Unlock()
-	go func() { _ = writeConfigAtomic(a.store.path, cfg) }()
 }
 func publicAPIKey(k APIKey) map[string]any {
 	return map[string]any{"id": k.ID, "name": k.Name, "prefix": k.Prefix, "permissions": k.Permissions, "enabled": k.Enabled, "created_at": k.CreatedAt, "expires_at": k.ExpiresAt, "last_used_at": k.LastUsedAt}
