@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"strconv"
@@ -32,13 +33,26 @@ func (t *providerCompatibilityTransport) RoundTrip(req *http.Request) (*http.Res
 		return t.base.RoundTrip(req)
 	}
 
-	original, err := io.ReadAll(req.Body)
+	// Only apply normalization to known provider hosts
+	hostname := req.URL.Hostname()
+	if !isAllowedProviderHost(hostname) {
+		return t.base.RoundTrip(req)
+	}
+
+	// Limit request body size to prevent memory exhaustion
+	const maxBodySize = 32 << 20 // 32 MB
+	limitedReader := io.LimitReader(req.Body, maxBodySize+1)
+	original, err := io.ReadAll(limitedReader)
 	if err != nil {
 		return nil, err
 	}
 	_ = req.Body.Close()
 
-	normalized, err := normalizeProviderChatRequest(req.URL.Hostname(), original)
+	if len(original) > maxBodySize {
+		return nil, errors.New("provider compatibility: request body exceeds maximum size of 32MB")
+	}
+
+	normalized, err := normalizeProviderChatRequest(hostname, original)
 	if err != nil {
 		normalized = original
 	}
@@ -62,6 +76,12 @@ func normalizeProviderChatRequest(host string, body []byte) ([]byte, error) {
 	decoder.UseNumber()
 	if err := decoder.Decode(&payload); err != nil {
 		return nil, err
+	}
+
+	// Check for trailing JSON data after the first decoded value
+	var trailing struct{}
+	if err := decoder.Decode(&trailing); err != io.EOF {
+		return nil, errors.New("request body contains trailing JSON data")
 	}
 
 	// Official OpenAI supports developer-role semantics natively. For the
@@ -151,4 +171,53 @@ func isNativeOpenAIHost(host string) bool {
 func isGroqHost(host string) bool {
 	host = strings.ToLower(strings.TrimSpace(host))
 	return host == "api.groq.com" || strings.HasSuffix(host, ".groq.com")
+}
+
+func isAllowedProviderHost(host string) bool {
+	host = strings.ToLower(strings.TrimSpace(host))
+
+	// OpenAI
+	if host == "api.openai.com" || strings.HasSuffix(host, ".openai.azure.com") {
+		return true
+	}
+
+	// Groq
+	if host == "api.groq.com" || strings.HasSuffix(host, ".groq.com") {
+		return true
+	}
+
+	// Anthropic
+	if host == "api.anthropic.com" || strings.HasSuffix(host, ".anthropic.com") {
+		return true
+	}
+
+	// Common OpenAI-compatible providers
+	if host == "api.together.xyz" || strings.HasSuffix(host, ".together.xyz") {
+		return true
+	}
+	if host == "api.fireworks.ai" || strings.HasSuffix(host, ".fireworks.ai") {
+		return true
+	}
+	if host == "api.deepseek.com" || strings.HasSuffix(host, ".deepseek.com") {
+		return true
+	}
+	if host == "api.mistral.ai" || strings.HasSuffix(host, ".mistral.ai") {
+		return true
+	}
+	if host == "api.cohere.ai" || strings.HasSuffix(host, ".cohere.ai") {
+		return true
+	}
+	if host == "api.replicate.com" || strings.HasSuffix(host, ".replicate.com") {
+		return true
+	}
+	if host == "openrouter.ai" || strings.HasSuffix(host, ".openrouter.ai") {
+		return true
+	}
+
+	// Localhost for development/testing
+	if host == "localhost" || host == "127.0.0.1" || host == "::1" {
+		return true
+	}
+
+	return false
 }
