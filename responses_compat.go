@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -26,11 +27,17 @@ func roundTripResponsesCompat(base http.RoundTripper, req *http.Request) (*http.
 		return base.RoundTrip(req)
 	}
 
-	original, err := io.ReadAll(req.Body)
+	const maxBodySize = 32 << 20 // 32 MB
+	limitedReader := io.LimitReader(req.Body, maxBodySize+1)
+	original, err := io.ReadAll(limitedReader)
 	if err != nil {
 		return nil, err
 	}
 	_ = req.Body.Close()
+
+	if len(original) > maxBodySize {
+		return jsonTransportError(req, http.StatusRequestEntityTooLarge, "request_too_large", "request body exceeds maximum size of 32MB"), nil
+	}
 
 	chatBody, stream, err := responsesRequestToChat(original)
 	if err != nil {
@@ -81,10 +88,14 @@ func responsesRequestToChat(body []byte) ([]byte, bool, error) {
 	if strings.TrimSpace(model) == "" {
 		return nil, false, fmt.Errorf("model must be a non-empty string")
 	}
-	for _, unsupported := range []string{"previous_response_id", "background", "conversation"} {
-		if value, ok := in[unsupported]; ok && value != nil && value != "" {
-			return nil, false, fmt.Errorf("%s is not supported by this provider through Rooter", unsupported)
-		}
+	if id, ok := in["previous_response_id"].(string); ok && strings.TrimSpace(id) != "" {
+		return nil, false, fmt.Errorf("previous_response_id is not supported by this provider through Rooter")
+	}
+	if bg, ok := in["background"].(bool); ok && bg {
+		return nil, false, fmt.Errorf("background is not supported by this provider through Rooter")
+	}
+	if conv, ok := in["conversation"].(map[string]any); ok && len(conv) > 0 {
+		return nil, false, fmt.Errorf("conversation is not supported by this provider through Rooter")
 	}
 
 	messages := make([]any, 0, 4)
@@ -193,11 +204,11 @@ func responseInputToMessages(value any) ([]any, error) {
 					return nil, fmt.Errorf("function_call requires call_id and name")
 				}
 				messages = append(messages, map[string]any{
-					"role": "assistant",
+					"role":    "assistant",
 					"content": nil,
 					"tool_calls": []any{map[string]any{
-						"id": callID,
-						"type": "function",
+						"id":       callID,
+						"type":     "function",
 						"function": map[string]any{"name": name, "arguments": arguments},
 					}},
 				})
@@ -207,12 +218,12 @@ func responseInputToMessages(value any) ([]any, error) {
 					return nil, fmt.Errorf("function_call_output requires call_id")
 				}
 				messages = append(messages, map[string]any{
-					"role": "tool",
+					"role":         "tool",
 					"tool_call_id": callID,
-					"content": responseOutputText(item["output"]),
+					"content":      responseOutputText(item["output"]),
 				})
+			case "reasoning", "web_search_call":
 			default:
-				return nil, fmt.Errorf("unsupported response input item type %q", typ)
 			}
 		}
 		return messages, nil
@@ -260,7 +271,10 @@ func responseOutputText(value any) string {
 	case string:
 		return v
 	default:
-		data, _ := json.Marshal(v)
+		data, err := json.Marshal(v)
+		if err != nil {
+			return ""
+		}
 		return string(data)
 	}
 }
@@ -350,9 +364,16 @@ func chatObjectToResponse(chat map[string]any) map[string]any {
 	id := "resp_" + strconv.FormatInt(time.Now().UnixNano(), 36)
 	model, _ := chat["model"].(string)
 	output := make([]any, 0, 2)
+	status := "completed"
+	var incompleteDetails any
 
 	if choices, ok := chat["choices"].([]any); ok && len(choices) > 0 {
 		if choice, ok := choices[0].(map[string]any); ok {
+			finishReason, _ := choice["finish_reason"].(string)
+			if finishReason == "length" || finishReason == "content_filter" {
+				status = "incomplete"
+				incompleteDetails = map[string]any{"reason": "max_output_tokens"}
+			}
 			if message, ok := choice["message"].(map[string]any); ok {
 				if content := responseMessageText(message["content"]); content != "" {
 					output = append(output, responseMessageItem("msg_"+strconv.FormatInt(time.Now().UnixNano(), 36), content))
@@ -369,16 +390,16 @@ func chatObjectToResponse(chat map[string]any) map[string]any {
 	}
 
 	return map[string]any{
-		"id": id,
-		"object": "response",
-		"created_at": time.Now().Unix(),
-		"status": "completed",
-		"model": model,
-		"output": output,
+		"id":                  id,
+		"object":              "response",
+		"created_at":          time.Now().Unix(),
+		"status":              status,
+		"model":               model,
+		"output":              output,
 		"parallel_tool_calls": true,
-		"usage": responseUsage(chat["usage"]),
-		"error": nil,
-		"incomplete_details": nil,
+		"usage":               responseUsage(chat["usage"]),
+		"error":               nil,
+		"incomplete_details":  incompleteDetails,
 	}
 }
 
@@ -403,13 +424,13 @@ func responseMessageText(content any) string {
 
 func responseMessageItem(id, text string) map[string]any {
 	return map[string]any{
-		"id": id,
-		"type": "message",
+		"id":     id,
+		"type":   "message",
 		"status": "completed",
-		"role": "assistant",
+		"role":   "assistant",
 		"content": []any{map[string]any{
-			"type": "output_text",
-			"text": text,
+			"type":        "output_text",
+			"text":        text,
 			"annotations": []any{},
 		}},
 	}
@@ -427,11 +448,11 @@ func responseFunctionCallItem(call map[string]any, index int) map[string]any {
 		arguments, _ = fn["arguments"].(string)
 	}
 	return map[string]any{
-		"id": "fc_" + strconv.FormatInt(time.Now().UnixNano()+int64(index), 36),
-		"type": "function_call",
-		"status": "completed",
-		"call_id": callID,
-		"name": name,
+		"id":        "fc_" + strconv.FormatInt(time.Now().UnixNano()+int64(index), 36),
+		"type":      "function_call",
+		"status":    "completed",
+		"call_id":   callID,
+		"name":      name,
 		"arguments": arguments,
 	}
 }
@@ -441,10 +462,10 @@ func responseUsage(value any) map[string]any {
 	input := numberValue(usage["prompt_tokens"])
 	output := numberValue(usage["completion_tokens"])
 	return map[string]any{
-		"input_tokens": input,
-		"output_tokens": output,
-		"total_tokens": input + output,
-		"input_tokens_details": map[string]any{"cached_tokens": 0},
+		"input_tokens":          input,
+		"output_tokens":         output,
+		"total_tokens":          input + output,
+		"input_tokens_details":  map[string]any{"cached_tokens": 0},
 		"output_tokens_details": map[string]any{"reasoning_tokens": 0},
 	}
 }
@@ -475,7 +496,7 @@ func chatStreamAsResponses(resp *http.Response) *http.Response {
 	clone.Body = reader
 
 	go func() {
-		defer writer.Close()
+		defer func() { _ = writer.Close() }()
 		defer resp.Body.Close()
 		translateChatSSEToResponses(resp.Body, writer)
 	}()
@@ -483,12 +504,12 @@ func chatStreamAsResponses(resp *http.Response) *http.Response {
 }
 
 type streamToolCall struct {
-	id string
-	name string
-	arguments strings.Builder
-	itemID string
+	id          string
+	name        string
+	arguments   strings.Builder
+	itemID      string
 	outputIndex int
-	started bool
+	started     bool
 }
 
 func translateChatSSEToResponses(src io.Reader, dst io.Writer) {
@@ -498,14 +519,20 @@ func translateChatSSEToResponses(src io.Reader, dst io.Writer) {
 	model := ""
 	messageID := "msg_" + strconv.FormatInt(time.Now().UnixNano(), 36)
 	messageStarted := false
+	messageIndex := 0
 	contentStarted := false
 	var text strings.Builder
 	tools := map[int]*streamToolCall{}
 	nextOutputIndex := 0
 
-	writeResponseSSE(dst, "response.created", &sequence, map[string]any{"response": streamResponseEnvelope(responseID, createdAt, model, "in_progress", nil)})
-	writeResponseSSE(dst, "response.in_progress", &sequence, map[string]any{"response": streamResponseEnvelope(responseID, createdAt, model, "in_progress", nil)})
+	if err := writeResponseSSE(dst, "response.created", &sequence, map[string]any{"response": streamResponseEnvelope(responseID, createdAt, model, "in_progress", nil)}); err != nil {
+		return
+	}
+	if err := writeResponseSSE(dst, "response.in_progress", &sequence, map[string]any{"response": streamResponseEnvelope(responseID, createdAt, model, "in_progress", nil)}); err != nil {
+		return
+	}
 
+	var upstreamError map[string]any
 	scanner := bufio.NewScanner(src)
 	scanner.Buffer(make([]byte, 0, 64*1024), 4*1024*1024)
 	for scanner.Scan() {
@@ -523,6 +550,10 @@ func translateChatSSEToResponses(src io.Reader, dst io.Writer) {
 		if decoder.Decode(&chunk) != nil {
 			continue
 		}
+		if err, ok := chunk["error"].(map[string]any); ok && err != nil {
+			upstreamError = err
+			break
+		}
 		if m, ok := chunk["model"].(string); ok && m != "" {
 			model = m
 		}
@@ -535,15 +566,22 @@ func translateChatSSEToResponses(src io.Reader, dst io.Writer) {
 		if content, ok := delta["content"].(string); ok && content != "" {
 			if !messageStarted {
 				messageStarted = true
+				messageIndex = nextOutputIndex
 				nextOutputIndex++
-				writeResponseSSE(dst, "response.output_item.added", &sequence, map[string]any{"output_index": 0, "item": map[string]any{"id": messageID, "type": "message", "status": "in_progress", "role": "assistant", "content": []any{}}})
+				if err := writeResponseSSE(dst, "response.output_item.added", &sequence, map[string]any{"output_index": messageIndex, "item": map[string]any{"id": messageID, "type": "message", "status": "in_progress", "role": "assistant", "content": []any{}}}); err != nil {
+					return
+				}
 			}
 			if !contentStarted {
 				contentStarted = true
-				writeResponseSSE(dst, "response.content_part.added", &sequence, map[string]any{"item_id": messageID, "output_index": 0, "content_index": 0, "part": map[string]any{"type": "output_text", "text": "", "annotations": []any{}}})
+				if err := writeResponseSSE(dst, "response.content_part.added", &sequence, map[string]any{"item_id": messageID, "output_index": messageIndex, "content_index": 0, "part": map[string]any{"type": "output_text", "text": "", "annotations": []any{}}}); err != nil {
+					return
+				}
 			}
 			text.WriteString(content)
-			writeResponseSSE(dst, "response.output_text.delta", &sequence, map[string]any{"item_id": messageID, "output_index": 0, "content_index": 0, "delta": content})
+			if err := writeResponseSSE(dst, "response.output_text.delta", &sequence, map[string]any{"item_id": messageID, "output_index": messageIndex, "content_index": 0, "delta": content}); err != nil {
+				return
+			}
 		}
 
 		if calls, ok := delta["tool_calls"].([]any); ok {
@@ -565,38 +603,77 @@ func translateChatSSEToResponses(src io.Reader, dst io.Writer) {
 				}
 				if !state.started && state.name != "" {
 					state.started = true
-					writeResponseSSE(dst, "response.output_item.added", &sequence, map[string]any{"output_index": state.outputIndex, "item": map[string]any{"id": state.itemID, "type": "function_call", "status": "in_progress", "call_id": state.id, "name": state.name, "arguments": ""}})
+					if err := writeResponseSSE(dst, "response.output_item.added", &sequence, map[string]any{"output_index": state.outputIndex, "item": map[string]any{"id": state.itemID, "type": "function_call", "status": "in_progress", "call_id": state.id, "name": state.name, "arguments": ""}}); err != nil {
+						return
+					}
 				}
 				if args, ok := fn["arguments"].(string); ok && args != "" {
 					state.arguments.WriteString(args)
-					writeResponseSSE(dst, "response.function_call_arguments.delta", &sequence, map[string]any{"item_id": state.itemID, "output_index": state.outputIndex, "delta": args})
+					if err := writeResponseSSE(dst, "response.function_call_arguments.delta", &sequence, map[string]any{"item_id": state.itemID, "output_index": state.outputIndex, "delta": args}); err != nil {
+						return
+					}
 				}
 			}
 		}
 	}
 
+	scanErr := scanner.Err()
 	output := make([]any, 0, nextOutputIndex)
+
+	if upstreamError != nil || scanErr != nil {
+		var finalStatus string
+		var finalEvent string
+		finalEnvelope := streamResponseEnvelope(responseID, createdAt, model, "failed", nil)
+		if upstreamError != nil {
+			finalStatus = "failed"
+			finalEvent = "response.failed"
+			finalEnvelope["error"] = upstreamError
+		} else {
+			finalStatus = "incomplete"
+			finalEvent = "response.incomplete"
+			finalEnvelope["incomplete_details"] = map[string]any{"reason": "stream_error"}
+		}
+		finalEnvelope["status"] = finalStatus
+		_ = writeResponseSSE(dst, finalEvent, &sequence, map[string]any{"response": finalEnvelope})
+		return
+	}
+
 	if messageStarted {
 		if contentStarted {
-			writeResponseSSE(dst, "response.output_text.done", &sequence, map[string]any{"item_id": messageID, "output_index": 0, "content_index": 0, "text": text.String()})
-			writeResponseSSE(dst, "response.content_part.done", &sequence, map[string]any{"item_id": messageID, "output_index": 0, "content_index": 0, "part": map[string]any{"type": "output_text", "text": text.String(), "annotations": []any{}}})
+			if err := writeResponseSSE(dst, "response.output_text.done", &sequence, map[string]any{"item_id": messageID, "output_index": messageIndex, "content_index": 0, "text": text.String()}); err != nil {
+				return
+			}
+			if err := writeResponseSSE(dst, "response.content_part.done", &sequence, map[string]any{"item_id": messageID, "output_index": messageIndex, "content_index": 0, "part": map[string]any{"type": "output_text", "text": text.String(), "annotations": []any{}}}); err != nil {
+				return
+			}
 		}
 		item := responseMessageItem(messageID, text.String())
 		output = append(output, item)
-		writeResponseSSE(dst, "response.output_item.done", &sequence, map[string]any{"output_index": 0, "item": item})
+		if err := writeResponseSSE(dst, "response.output_item.done", &sequence, map[string]any{"output_index": messageIndex, "item": item}); err != nil {
+			return
+		}
 	}
-	for i := 0; i < len(tools); i++ {
-		state := tools[i]
+	toolIndices := make([]int, 0, len(tools))
+	for idx := range tools {
+		toolIndices = append(toolIndices, idx)
+	}
+	sort.Ints(toolIndices)
+	for _, idx := range toolIndices {
+		state := tools[idx]
 		if state == nil {
 			continue
 		}
-		writeResponseSSE(dst, "response.function_call_arguments.done", &sequence, map[string]any{"item_id": state.itemID, "output_index": state.outputIndex, "arguments": state.arguments.String()})
+		if err := writeResponseSSE(dst, "response.function_call_arguments.done", &sequence, map[string]any{"item_id": state.itemID, "output_index": state.outputIndex, "arguments": state.arguments.String()}); err != nil {
+			return
+		}
 		item := map[string]any{"id": state.itemID, "type": "function_call", "status": "completed", "call_id": state.id, "name": state.name, "arguments": state.arguments.String()}
 		output = append(output, item)
-		writeResponseSSE(dst, "response.output_item.done", &sequence, map[string]any{"output_index": state.outputIndex, "item": item})
+		if err := writeResponseSSE(dst, "response.output_item.done", &sequence, map[string]any{"output_index": state.outputIndex, "item": item}); err != nil {
+			return
+		}
 	}
 	final := streamResponseEnvelope(responseID, createdAt, model, "completed", output)
-	writeResponseSSE(dst, "response.completed", &sequence, map[string]any{"response": final})
+	_ = writeResponseSSE(dst, "response.completed", &sequence, map[string]any{"response": final})
 }
 
 func streamResponseEnvelope(id string, createdAt int64, model, status string, output []any) map[string]any {
@@ -604,37 +681,38 @@ func streamResponseEnvelope(id string, createdAt int64, model, status string, ou
 		output = []any{}
 	}
 	return map[string]any{
-		"id": id,
-		"object": "response",
-		"created_at": createdAt,
-		"status": status,
-		"model": model,
-		"output": output,
+		"id":                  id,
+		"object":              "response",
+		"created_at":          createdAt,
+		"status":              status,
+		"model":               model,
+		"output":              output,
 		"parallel_tool_calls": true,
-		"error": nil,
-		"incomplete_details": nil,
+		"error":               nil,
+		"incomplete_details":  nil,
 	}
 }
 
-func writeResponseSSE(w io.Writer, event string, sequence *int, fields map[string]any) {
+func writeResponseSSE(w io.Writer, event string, sequence *int, fields map[string]any) error {
 	fields["type"] = event
 	fields["sequence_number"] = *sequence
 	*sequence++
 	data, err := json.Marshal(fields)
 	if err != nil {
-		return
+		return err
 	}
-	_, _ = fmt.Fprintf(w, "event: %s\ndata: %s\n\n", event, data)
+	_, err = fmt.Fprintf(w, "event: %s\ndata: %s\n\n", event, data)
+	return err
 }
 
 func jsonTransportError(req *http.Request, status int, code, message string) *http.Response {
 	body, _ := json.Marshal(map[string]any{"error": map[string]any{"message": message, "type": "invalid_request_error", "code": code}})
 	return &http.Response{
-		StatusCode: status,
-		Status: fmt.Sprintf("%d %s", status, http.StatusText(status)),
-		Header: http.Header{"Content-Type": []string{"application/json"}},
-		Body: io.NopCloser(bytes.NewReader(body)),
+		StatusCode:    status,
+		Status:        fmt.Sprintf("%d %s", status, http.StatusText(status)),
+		Header:        http.Header{"Content-Type": []string{"application/json"}},
+		Body:          io.NopCloser(bytes.NewReader(body)),
 		ContentLength: int64(len(body)),
-		Request: req,
+		Request:       req,
 	}
 }

@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -9,12 +10,18 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 )
 
 var embeddingRequests = struct {
 	sync.Mutex
 	models map[string]string
 }{models: map[string]string{}}
+
+type embeddingChainKeyType struct{}
+
+var embeddingChainKey = embeddingChainKeyType{}
+var nextEmbeddingChainID atomic.Uint64
 
 func init() {
 	base := http.DefaultTransport
@@ -74,7 +81,16 @@ func embeddingRequestModel(body []byte) (string, error) {
 }
 
 func guardEmbeddingModel(req *http.Request, model string) error {
-	key := fmt.Sprintf("%p", req.Context())
+	ctx := req.Context()
+	var key string
+	if chainID, ok := ctx.Value(embeddingChainKey).(string); ok {
+		key = chainID
+	} else {
+		key = fmt.Sprintf("chain_%d", nextEmbeddingChainID.Add(1))
+		ctx = context.WithValue(ctx, embeddingChainKey, key)
+		*req = *req.WithContext(ctx)
+	}
+
 	embeddingRequests.Lock()
 	previous, ok := embeddingRequests.models[key]
 	if !ok {
@@ -83,9 +99,16 @@ func guardEmbeddingModel(req *http.Request, model string) error {
 	embeddingRequests.Unlock()
 
 	if !ok {
-		if done := req.Context().Done(); done != nil {
+		done := req.Context().Done()
+		if done != nil {
 			go func() {
 				<-done
+				embeddingRequests.Lock()
+				delete(embeddingRequests.models, key)
+				embeddingRequests.Unlock()
+			}()
+		} else {
+			go func() {
 				embeddingRequests.Lock()
 				delete(embeddingRequests.models, key)
 				embeddingRequests.Unlock()
