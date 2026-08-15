@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"crypto/subtle"
 	"fmt"
 	"io"
@@ -11,31 +12,488 @@ import (
 )
 
 const (
-	permChat = "chat"; permResponses = "responses"; permEmbeddings = "embeddings"; permModelsRead = "models.read"; permModelsWrite = "models.write"; permProvidersRead = "providers.read"; permProvidersWrite = "providers.write"; permChainsRead = "chains.read"; permChainsWrite = "chains.write"; permKeysRead = "keys.read"; permKeysWrite = "keys.write"; permConfigRead = "config.read"; permConfigWrite = "config.write"
+	permChat           = "chat"
+	permResponses      = "responses"
+	permEmbeddings     = "embeddings"
+	permModelsRead     = "models.read"
+	permModelsWrite    = "models.write"
+	permProvidersRead  = "providers.read"
+	permProvidersWrite = "providers.write"
+	permChainsRead     = "chains.read"
+	permChainsWrite    = "chains.write"
+	permKeysRead       = "keys.read"
+	permKeysWrite      = "keys.write"
+	permConfigRead     = "config.read"
+	permConfigWrite    = "config.write"
 )
-func allAPIPermissions()[]string{return []string{permChat,permResponses,permEmbeddings,permModelsRead,permModelsWrite,permProvidersRead,permProvidersWrite,permChainsRead,permChainsWrite,permKeysRead,permKeysWrite,permConfigRead,permConfigWrite}}
-func publicAPIPermissions()[]string{return []string{permChat,permResponses,permEmbeddings,permModelsRead}}
-func validAPIPermission(p string)bool{return slices.Contains(allAPIPermissions(),p)}
 
-func (a *App) scopedAuthMiddleware(next http.Handler)http.Handler{return http.HandlerFunc(func(w http.ResponseWriter,r *http.Request){
-	if r.Method==http.MethodGet&&r.URL.Path=="/"{w.Header().Set("Content-Type","text/html; charset=utf-8");_,_=io.WriteString(w,adminHTMLV2);return}
-	if r.URL.Path=="/healthz"{next.ServeHTTP(w,r);return}
-	perm,protected:=requiredPermission(r);if !protected{next.ServeHTTP(w,r);return}
-	raw:=bearerToken(r.Header.Get("Authorization"));if raw==""{raw=strings.TrimSpace(r.Header.Get("X-Rooter-Admin-Token"))};if raw==""{writeScopedAuthError(w,http.StatusUnauthorized,"API key required");return}
-	if a.adminTokenEnv!=""&&subtle.ConstantTimeCompare([]byte(raw),[]byte(a.adminTokenEnv))==1{a.rewriteLegacyAuthHeader(r);a.dispatchScopedEndpoint(w,r,next);return}
-	key,ok:=a.authenticateScopedKey(raw);if !ok{writeScopedAuthError(w,http.StatusUnauthorized,"invalid or expired API key");return};if !slices.Contains(key.Permissions,perm){writeScopedAuthError(w,http.StatusForbidden,fmt.Sprintf("API key lacks %s permission",perm));return};a.touchAPIKey(key.ID);a.rewriteLegacyAuthHeader(r);a.dispatchScopedEndpoint(w,r,next)
-})}
-func (a *App) dispatchScopedEndpoint(w http.ResponseWriter,r *http.Request,next http.Handler){if r.URL.Path=="/admin/api/api-keys"{a.handleScopedAPIKeys(w,r);return};if strings.HasPrefix(r.URL.Path,"/admin/api/api-keys/"){a.handleScopedAPIKey(w,r);return};if r.URL.Path=="/admin/api/public-api-keys"{a.handleLegacyPublicKeyAlias(w,r);return};if r.URL.Path=="/admin/api/admin-token"{a.handleLegacyAdminKeyAlias(w,r);return};next.ServeHTTP(w,r)}
-func requiredPermission(r *http.Request)(string,bool){p:=r.URL.Path;write:=r.Method!=http.MethodGet&&r.Method!=http.MethodHead;switch{case strings.HasPrefix(p,"/v1/models"):return permModelsRead,true;case strings.HasPrefix(p,"/v1/responses"):return permResponses,true;case strings.HasPrefix(p,"/v1/embeddings"):return permEmbeddings,true;case strings.HasPrefix(p,"/v1/"):return permChat,true;case !strings.HasPrefix(p,"/admin/api/"):return "",false;case strings.HasPrefix(p,"/admin/api/providers")||p=="/admin/api/discover":if write&&p!="/admin/api/discover"{return permProvidersWrite,true};return permProvidersRead,true;case strings.HasPrefix(p,"/admin/api/chains"):if write{return permChainsWrite,true};return permChainsRead,true;case strings.HasPrefix(p,"/admin/api/models")||p=="/admin/api/activate":if write{return permModelsWrite,true};return permModelsRead,true;case strings.HasPrefix(p,"/admin/api/api-keys")||p=="/admin/api/public-api-keys"||p=="/admin/api/admin-token":if write{return permKeysWrite,true};return permKeysRead,true;case p=="/admin/api/config":if write{return permConfigWrite,true};return permConfigRead,true;default:return permConfigRead,true}}
-func (a *App) rewriteLegacyAuthHeader(r *http.Request){if strings.HasPrefix(r.URL.Path,"/admin/"){r.Header.Set("Authorization","Bearer "+internalAdminAuthSentinel);r.Header.Set("X-Rooter-Admin-Token",internalAdminAuthSentinel)}else if strings.HasPrefix(r.URL.Path,"/v1/"){r.Header.Set("Authorization","Bearer "+internalPublicAuthSentinel)}}
-func (a *App) authenticateScopedKey(raw string)(APIKey,bool){hash:=hashAPIKey(raw);now:=time.Now();for _,k:=range a.store.Snapshot().APIKeys{if !k.Enabled||(k.ExpiresAt!=nil&&!k.ExpiresAt.After(now)){continue};if subtle.ConstantTimeCompare([]byte(hash),[]byte(k.Hash))==1{return k,true}};return APIKey{},false}
-func (a *App) touchAPIKey(id string){cfg:=a.store.Snapshot();for _,k:=range cfg.APIKeys{if k.ID==id&&k.LastUsedAt!=nil&&time.Since(*k.LastUsedAt)<15*time.Minute{return}};now:=time.Now().UTC();_,_=a.store.Update(func(cfg *Config)error{for i:=range cfg.APIKeys{if cfg.APIKeys[i].ID==id{cfg.APIKeys[i].LastUsedAt=&now;break}};return nil})}
-func publicAPIKey(k APIKey)map[string]any{return map[string]any{"id":k.ID,"name":k.Name,"prefix":k.Prefix,"permissions":k.Permissions,"enabled":k.Enabled,"created_at":k.CreatedAt,"expires_at":k.ExpiresAt,"last_used_at":k.LastUsedAt}}
-func createStoredAPIKey(raw,name string,permissions []string,expires *time.Time)APIKey{hash:=hashAPIKey(raw);prefix:=raw;if len(prefix)>12{prefix=prefix[:12]};return APIKey{ID:"key-"+hash[:12],Name:name,Prefix:prefix,Hash:hash,Permissions:compactUnique(permissions),Enabled:true,CreatedAt:time.Now().UTC(),ExpiresAt:expires}}
+func allAPIPermissions() []string {
+	return []string{permChat, permResponses, permEmbeddings, permModelsRead, permModelsWrite, permProvidersRead, permProvidersWrite, permChainsRead, permChainsWrite, permKeysRead, permKeysWrite, permConfigRead, permConfigWrite}
+}
+func publicAPIPermissions() []string {
+	return []string{permChat, permResponses, permEmbeddings, permModelsRead}
+}
+func validAPIPermission(p string) bool { return slices.Contains(allAPIPermissions(), p) }
+func hasAllPermissions(perms []string) bool {
+	all := allAPIPermissions()
+	if len(perms) != len(all) {
+		return false
+	}
+	for _, p := range all {
+		if !slices.Contains(perms, p) {
+			return false
+		}
+	}
+	return true
+}
 
-func (a *App) handleScopedAPIKeys(w http.ResponseWriter,r *http.Request){switch r.Method{case http.MethodGet:data:=[]map[string]any{};for _,k:=range a.store.Snapshot().APIKeys{data=append(data,publicAPIKey(k))};writeJSON(w,http.StatusOK,map[string]any{"object":"list","data":data});case http.MethodPost:defer r.Body.Close();var body struct{Name string `json:"name"`;Permissions []string `json:"permissions"`;ExpiresAt *time.Time `json:"expires_at"`};if err:=decodeAdminJSON(w,r,&body);err!=nil{writeProblem(w,http.StatusBadRequest,"invalid JSON",err.Error());return};if len(body.Permissions)==0{body.Permissions=publicAPIPermissions()};for _,p:=range body.Permissions{if !validAPIPermission(p){writeProblem(w,http.StatusBadRequest,"invalid permission",p);return}};raw:=generateRawAPIKey();name:=strings.TrimSpace(body.Name);if name==""{name="API key"};created:=createStoredAPIKey(raw,name,body.Permissions,body.ExpiresAt);_,err:=a.store.Update(func(cfg *Config)error{cfg.APIKeys=append(cfg.APIKeys,created);return nil});if err!=nil{writeAdminMutationError(w,err);return};out:=publicAPIKey(created);out["key"]=raw;writeJSON(w,http.StatusCreated,out);default:w.Header().Set("Allow","GET, POST");writeProblem(w,http.StatusMethodNotAllowed,"method not allowed","")}}
-func (a *App) handleScopedAPIKey(w http.ResponseWriter,r *http.Request){id,err:=pathResourceID(r.URL,"/admin/api/api-keys/");if err!=nil{writeProblem(w,http.StatusNotFound,"API key not found","");return};cfg:=a.store.Snapshot();idx:=-1;for i:=range cfg.APIKeys{if cfg.APIKeys[i].ID==id{idx=i;break}};if idx<0{writeProblem(w,http.StatusNotFound,"API key not found",id);return};switch r.Method{case http.MethodGet:writeJSON(w,http.StatusOK,publicAPIKey(cfg.APIKeys[idx]));case http.MethodPatch:defer r.Body.Close();var body struct{Name *string `json:"name"`;Permissions *[]string `json:"permissions"`;Enabled *bool `json:"enabled"`;ExpiresAt *time.Time `json:"expires_at"`};if err:=decodeAdminJSON(w,r,&body);err!=nil{writeProblem(w,http.StatusBadRequest,"invalid JSON",err.Error());return};var updated APIKey;_,err:=a.store.Update(func(cfg *Config)error{for i:=range cfg.APIKeys{if cfg.APIKeys[i].ID!=id{continue};if body.Name!=nil{cfg.APIKeys[i].Name=strings.TrimSpace(*body.Name)};if body.Permissions!=nil{for _,p:=range *body.Permissions{if !validAPIPermission(p){return fmt.Errorf("invalid permission %q",p)}};cfg.APIKeys[i].Permissions=compactUnique(*body.Permissions)};if body.Enabled!=nil{cfg.APIKeys[i].Enabled=*body.Enabled};if body.ExpiresAt!=nil{cfg.APIKeys[i].ExpiresAt=body.ExpiresAt};updated=cfg.APIKeys[i];return nil};return errAdminNotFound});if err!=nil{writeAdminMutationError(w,err);return};writeJSON(w,http.StatusOK,publicAPIKey(updated));case http.MethodDelete:_,err:=a.store.Update(func(cfg *Config)error{for i:=range cfg.APIKeys{if cfg.APIKeys[i].ID==id{cfg.APIKeys=append(cfg.APIKeys[:i],cfg.APIKeys[i+1:]...);return nil}};return errAdminNotFound});if err!=nil{writeAdminMutationError(w,err);return};w.WriteHeader(http.StatusNoContent);default:w.Header().Set("Allow","GET, PATCH, DELETE");writeProblem(w,http.StatusMethodNotAllowed,"method not allowed","")}}
+func (a *App) scopedAuthMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodGet && r.URL.Path == "/" {
+			w.Header().Set("Content-Type", "text/html; charset=utf-8")
+			_, _ = io.WriteString(w, adminHTMLV2)
+			return
+		}
+		if r.URL.Path == "/healthz" {
+			next.ServeHTTP(w, r)
+			return
+		}
+		perm, protected := requiredPermission(r)
+		if !protected {
+			next.ServeHTTP(w, r)
+			return
+		}
+		raw := bearerToken(r.Header.Get("Authorization"))
+		if raw == "" {
+			raw = strings.TrimSpace(r.Header.Get("X-Rooter-Admin-Token"))
+		}
+		if raw == "" {
+			writeScopedAuthError(w, http.StatusUnauthorized, "API key required")
+			return
+		}
+		if a.adminTokenEnv != "" && subtle.ConstantTimeCompare([]byte(raw), []byte(a.adminTokenEnv)) == 1 {
+			a.rewriteLegacyAuthHeader(r)
+			a.dispatchScopedEndpoint(w, r, next)
+			return
+		}
+		key, ok := a.authenticateScopedKey(raw)
+		if !ok {
+			writeScopedAuthError(w, http.StatusUnauthorized, "invalid or expired API key")
+			return
+		}
+		if !slices.Contains(key.Permissions, perm) {
+			writeScopedAuthError(w, http.StatusForbidden, fmt.Sprintf("API key lacks %s permission", perm))
+			return
+		}
+		a.touchAPIKey(key.ID)
+		a.rewriteLegacyAuthHeader(r)
+		ctx := context.WithValue(r.Context(), "scopedAPIKey", key)
+		a.dispatchScopedEndpoint(w, r.WithContext(ctx), next)
+	})
+}
+func (a *App) dispatchScopedEndpoint(w http.ResponseWriter, r *http.Request, next http.Handler) {
+	if r.URL.Path == "/admin/api/api-keys" {
+		a.handleScopedAPIKeys(w, r)
+		return
+	}
+	if strings.HasPrefix(r.URL.Path, "/admin/api/api-keys/") {
+		a.handleScopedAPIKey(w, r)
+		return
+	}
+	if r.URL.Path == "/admin/api/public-api-keys" {
+		a.handleLegacyPublicKeyAlias(w, r)
+		return
+	}
+	if r.URL.Path == "/admin/api/admin-token" {
+		a.handleLegacyAdminKeyAlias(w, r)
+		return
+	}
+	next.ServeHTTP(w, r)
+}
+func requiredPermission(r *http.Request) (string, bool) {
+	p := r.URL.Path
+	write := r.Method != http.MethodGet && r.Method != http.MethodHead
+	switch {
+	case p == "/v1/models" || strings.HasPrefix(p, "/v1/models/"):
+		if write {
+			return permModelsWrite, true
+		}
+		return permModelsRead, true
+	case strings.HasPrefix(p, "/v1/responses"):
+		return permResponses, true
+	case strings.HasPrefix(p, "/v1/embeddings"):
+		return permEmbeddings, true
+	case strings.HasPrefix(p, "/v1/"):
+		return permChat, true
+	case !strings.HasPrefix(p, "/admin/api/"):
+		return "", false
+	case p == "/admin/api/providers" || strings.HasPrefix(p, "/admin/api/providers/") || p == "/admin/api/discover":
+		if write && p != "/admin/api/discover" {
+			return permProvidersWrite, true
+		}
+		return permProvidersRead, true
+	case p == "/admin/api/chains" || strings.HasPrefix(p, "/admin/api/chains/"):
+		if write {
+			return permChainsWrite, true
+		}
+		return permChainsRead, true
+	case p == "/admin/api/models" || strings.HasPrefix(p, "/admin/api/models/") || p == "/admin/api/activate":
+		if write {
+			return permModelsWrite, true
+		}
+		return permModelsRead, true
+	case p == "/admin/api/api-keys" || strings.HasPrefix(p, "/admin/api/api-keys/") || p == "/admin/api/public-api-keys" || p == "/admin/api/admin-token":
+		if write {
+			return permKeysWrite, true
+		}
+		return permKeysRead, true
+	case p == "/admin/api/config":
+		if write {
+			return permConfigWrite, true
+		}
+		return permConfigRead, true
+	default:
+		if write {
+			return permConfigWrite, true
+		}
+		return permConfigRead, true
+	}
+}
+func (a *App) rewriteLegacyAuthHeader(r *http.Request) {
+	if strings.HasPrefix(r.URL.Path, "/admin/") {
+		r.Header.Set("Authorization", "Bearer "+internalAdminAuthSentinel)
+		r.Header.Set("X-Rooter-Admin-Token", internalAdminAuthSentinel)
+	} else if strings.HasPrefix(r.URL.Path, "/v1/") {
+		r.Header.Set("Authorization", "Bearer "+internalPublicAuthSentinel)
+	}
+}
+func (a *App) authenticateScopedKey(raw string) (APIKey, bool) {
+	hash := hashAPIKey(raw)
+	now := time.Now()
+	for _, k := range a.store.Snapshot().APIKeys {
+		if !k.Enabled || (k.ExpiresAt != nil && !k.ExpiresAt.After(now)) {
+			continue
+		}
+		if subtle.ConstantTimeCompare([]byte(hash), []byte(k.Hash)) == 1 {
+			return k, true
+		}
+	}
+	return APIKey{}, false
+}
+func (a *App) touchAPIKey(id string) {
+	a.store.mu.Lock()
+	shouldUpdate := true
+	for _, k := range a.store.cfg.APIKeys {
+		if k.ID == id {
+			if k.LastUsedAt != nil && time.Since(*k.LastUsedAt) < 15*time.Minute {
+				shouldUpdate = false
+			}
+			break
+		}
+	}
+	if !shouldUpdate {
+		a.store.mu.Unlock()
+		return
+	}
+	now := time.Now().UTC()
+	for i := range a.store.cfg.APIKeys {
+		if a.store.cfg.APIKeys[i].ID == id {
+			a.store.cfg.APIKeys[i].LastUsedAt = &now
+			break
+		}
+	}
+	cfg := cloneConfig(a.store.cfg)
+	a.store.mu.Unlock()
+	go func() { _ = writeConfigAtomic(a.store.path, cfg) }()
+}
+func publicAPIKey(k APIKey) map[string]any {
+	return map[string]any{"id": k.ID, "name": k.Name, "prefix": k.Prefix, "permissions": k.Permissions, "enabled": k.Enabled, "created_at": k.CreatedAt, "expires_at": k.ExpiresAt, "last_used_at": k.LastUsedAt}
+}
+func createStoredAPIKey(raw, name string, permissions []string, expires *time.Time) APIKey {
+	hash := hashAPIKey(raw)
+	prefix := raw
+	if len(prefix) > 12 {
+		prefix = prefix[:12]
+	}
+	return APIKey{ID: generateAPIKeyID(), Name: name, Prefix: prefix, Hash: hash, Permissions: compactUnique(permissions), Enabled: true, CreatedAt: time.Now().UTC(), ExpiresAt: expires}
+}
 
-func (a *App) handleLegacyPublicKeyAlias(w http.ResponseWriter,r *http.Request){switch r.Method{case http.MethodGet:data:=[]map[string]any{};for _,k:=range a.store.Snapshot().APIKeys{if slices.Contains(k.Permissions,permChat){data=append(data,publicAPIKey(k))}};writeJSON(w,http.StatusOK,map[string]any{"object":"list","data":data});case http.MethodPost:defer r.Body.Close();var body struct{Key string `json:"key"`};if r.ContentLength!=0{if err:=decodeAdminJSON(w,r,&body);err!=nil{writeProblem(w,http.StatusBadRequest,"invalid JSON",err.Error());return}};raw:=strings.TrimSpace(body.Key);if raw==""{raw=generateRawAPIKey()};created:=createStoredAPIKey(raw,"Legacy public API key",publicAPIPermissions(),nil);_,err:=a.store.Update(func(cfg *Config)error{for _,k:=range cfg.APIKeys{if k.Hash==created.Hash{return errAdminConflict}};cfg.APIKeys=append(cfg.APIKeys,created);return nil});if err!=nil{writeAdminMutationError(w,err);return};writeJSON(w,http.StatusCreated,map[string]string{"key":raw});case http.MethodDelete:defer r.Body.Close();var body struct{Key string `json:"key"`};if err:=decodeAdminJSON(w,r,&body);err!=nil{writeProblem(w,http.StatusBadRequest,"invalid JSON",err.Error());return};hash:=hashAPIKey(strings.TrimSpace(body.Key));_,err:=a.store.Update(func(cfg *Config)error{for i:=range cfg.APIKeys{if cfg.APIKeys[i].Hash==hash{cfg.APIKeys=append(cfg.APIKeys[:i],cfg.APIKeys[i+1:]...);return nil}};return errAdminNotFound});if err!=nil{writeAdminMutationError(w,err);return};w.WriteHeader(http.StatusNoContent);default:w.Header().Set("Allow","GET, POST, DELETE");writeProblem(w,http.StatusMethodNotAllowed,"method not allowed","")}}
-func (a *App) handleLegacyAdminKeyAlias(w http.ResponseWriter,r *http.Request){switch r.Method{case http.MethodGet:writeJSON(w,http.StatusOK,map[string]any{"environment_managed":a.adminTokenEnv!="","token":redactedSecret});case http.MethodPost:raw:=generateRawAPIKey();created:=createStoredAPIKey(raw,"Legacy admin key",allAPIPermissions(),nil);_,err:=a.store.Update(func(cfg *Config)error{cfg.APIKeys=append(cfg.APIKeys,created);return nil});if err!=nil{writeAdminMutationError(w,err);return};writeJSON(w,http.StatusCreated,map[string]string{"token":raw});case http.MethodPut:defer r.Body.Close();var body struct{Token string `json:"token"`};if err:=decodeAdminJSON(w,r,&body);err!=nil{writeProblem(w,http.StatusBadRequest,"invalid JSON",err.Error());return};raw:=strings.TrimSpace(body.Token);if raw==""{writeProblem(w,http.StatusBadRequest,"token required","");return};created:=createStoredAPIKey(raw,"Legacy admin key",allAPIPermissions(),nil);_,err:=a.store.Update(func(cfg *Config)error{cfg.APIKeys=append(cfg.APIKeys,created);return nil});if err!=nil{writeAdminMutationError(w,err);return};writeJSON(w,http.StatusOK,map[string]string{"token":raw});default:w.Header().Set("Allow","GET, POST, PUT");writeProblem(w,http.StatusMethodNotAllowed,"method not allowed","")}}
-func writeScopedAuthError(w http.ResponseWriter,status int,message string){w.Header().Set("WWW-Authenticate",`Bearer realm="rooter"`);writeJSON(w,status,map[string]any{"error":map[string]any{"message":message,"type":"authentication_error"}})}
+func (a *App) handleScopedAPIKeys(w http.ResponseWriter, r *http.Request) {
+	switch r.Method {
+	case http.MethodGet:
+		data := []map[string]any{}
+		for _, k := range a.store.Snapshot().APIKeys {
+			data = append(data, publicAPIKey(k))
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"object": "list", "data": data})
+	case http.MethodPost:
+		defer r.Body.Close()
+		var body struct {
+			Name        string     `json:"name"`
+			Permissions []string   `json:"permissions"`
+			ExpiresAt   *time.Time `json:"expires_at"`
+		}
+		if err := decodeAdminJSON(w, r, &body); err != nil {
+			writeProblem(w, http.StatusBadRequest, "invalid JSON", err.Error())
+			return
+		}
+		if len(body.Permissions) == 0 {
+			body.Permissions = publicAPIPermissions()
+		}
+		for _, p := range body.Permissions {
+			if !validAPIPermission(p) {
+				writeProblem(w, http.StatusBadRequest, "invalid permission", p)
+				return
+			}
+		}
+		callerKey, isKeyAuth := r.Context().Value("scopedAPIKey").(APIKey)
+		if isKeyAuth {
+			for _, p := range body.Permissions {
+				if !slices.Contains(callerKey.Permissions, p) {
+					writeProblem(w, http.StatusForbidden, "permission escalation denied", fmt.Sprintf("caller lacks %s permission", p))
+					return
+				}
+			}
+		}
+		raw := generateRawAPIKey()
+		name := strings.TrimSpace(body.Name)
+		if name == "" {
+			name = "API key"
+		}
+		created := createStoredAPIKey(raw, name, body.Permissions, body.ExpiresAt)
+		_, err := a.store.Update(func(cfg *Config) error { cfg.APIKeys = append(cfg.APIKeys, created); return nil })
+		if err != nil {
+			writeAdminMutationError(w, err)
+			return
+		}
+		out := publicAPIKey(created)
+		out["key"] = raw
+		writeJSON(w, http.StatusCreated, out)
+	default:
+		w.Header().Set("Allow", "GET, POST")
+		writeProblem(w, http.StatusMethodNotAllowed, "method not allowed", "")
+	}
+}
+func (a *App) handleScopedAPIKey(w http.ResponseWriter, r *http.Request) {
+	id, err := pathResourceID(r.URL, "/admin/api/api-keys/")
+	if err != nil {
+		writeProblem(w, http.StatusNotFound, "API key not found", "")
+		return
+	}
+	cfg := a.store.Snapshot()
+	idx := -1
+	for i := range cfg.APIKeys {
+		if cfg.APIKeys[i].ID == id {
+			idx = i
+			break
+		}
+	}
+	if idx < 0 {
+		writeProblem(w, http.StatusNotFound, "API key not found", id)
+		return
+	}
+	switch r.Method {
+	case http.MethodGet:
+		writeJSON(w, http.StatusOK, publicAPIKey(cfg.APIKeys[idx]))
+	case http.MethodPatch:
+		defer r.Body.Close()
+		var body struct {
+			Name        *string    `json:"name"`
+			Permissions *[]string  `json:"permissions"`
+			Enabled     *bool      `json:"enabled"`
+			ExpiresAt   *time.Time `json:"expires_at"`
+		}
+		if err := decodeAdminJSON(w, r, &body); err != nil {
+			writeProblem(w, http.StatusBadRequest, "invalid JSON", err.Error())
+			return
+		}
+		var updated APIKey
+		_, err := a.store.Update(func(cfg *Config) error {
+			for i := range cfg.APIKeys {
+				if cfg.APIKeys[i].ID != id {
+					continue
+				}
+				if body.Name != nil {
+					cfg.APIKeys[i].Name = strings.TrimSpace(*body.Name)
+				}
+				if body.Permissions != nil {
+					for _, p := range *body.Permissions {
+						if !validAPIPermission(p) {
+							return fmt.Errorf("invalid permission %q", p)
+						}
+					}
+					cfg.APIKeys[i].Permissions = compactUnique(*body.Permissions)
+				}
+				if body.Enabled != nil {
+					cfg.APIKeys[i].Enabled = *body.Enabled
+				}
+				if body.ExpiresAt != nil {
+					cfg.APIKeys[i].ExpiresAt = body.ExpiresAt
+				}
+				updated = cfg.APIKeys[i]
+				return nil
+			}
+			return errAdminNotFound
+		})
+		if err != nil {
+			writeAdminMutationError(w, err)
+			return
+		}
+		writeJSON(w, http.StatusOK, publicAPIKey(updated))
+	case http.MethodDelete:
+		_, err := a.store.Update(func(cfg *Config) error {
+			for i := range cfg.APIKeys {
+				if cfg.APIKeys[i].ID == id {
+					cfg.APIKeys = append(cfg.APIKeys[:i], cfg.APIKeys[i+1:]...)
+					return nil
+				}
+			}
+			return errAdminNotFound
+		})
+		if err != nil {
+			writeAdminMutationError(w, err)
+			return
+		}
+		w.WriteHeader(http.StatusNoContent)
+	default:
+		w.Header().Set("Allow", "GET, PATCH, DELETE")
+		writeProblem(w, http.StatusMethodNotAllowed, "method not allowed", "")
+	}
+}
+
+func (a *App) handleLegacyPublicKeyAlias(w http.ResponseWriter, r *http.Request) {
+	switch r.Method {
+	case http.MethodGet:
+		data := []map[string]any{}
+		for _, k := range a.store.Snapshot().APIKeys {
+			if slices.Contains(k.Permissions, permChat) {
+				data = append(data, publicAPIKey(k))
+			}
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"object": "list", "data": data})
+	case http.MethodPost:
+		defer r.Body.Close()
+		var body struct {
+			Key string `json:"key"`
+		}
+		if r.ContentLength != 0 {
+			if err := decodeAdminJSON(w, r, &body); err != nil {
+				writeProblem(w, http.StatusBadRequest, "invalid JSON", err.Error())
+				return
+			}
+		}
+		raw := strings.TrimSpace(body.Key)
+		if raw == "" {
+			raw = generateRawAPIKey()
+		}
+		created := createStoredAPIKey(raw, "Legacy public API key", publicAPIPermissions(), nil)
+		_, err := a.store.Update(func(cfg *Config) error {
+			for _, k := range cfg.APIKeys {
+				if k.Hash == created.Hash {
+					return errAdminConflict
+				}
+			}
+			cfg.APIKeys = append(cfg.APIKeys, created)
+			return nil
+		})
+		if err != nil {
+			writeAdminMutationError(w, err)
+			return
+		}
+		writeJSON(w, http.StatusCreated, map[string]string{"key": raw})
+	case http.MethodDelete:
+		defer r.Body.Close()
+		var body struct {
+			Key string `json:"key"`
+		}
+		if err := decodeAdminJSON(w, r, &body); err != nil {
+			writeProblem(w, http.StatusBadRequest, "invalid JSON", err.Error())
+			return
+		}
+		hash := hashAPIKey(strings.TrimSpace(body.Key))
+		_, err := a.store.Update(func(cfg *Config) error {
+			for i := range cfg.APIKeys {
+				if cfg.APIKeys[i].Hash == hash {
+					cfg.APIKeys = append(cfg.APIKeys[:i], cfg.APIKeys[i+1:]...)
+					return nil
+				}
+			}
+			return errAdminNotFound
+		})
+		if err != nil {
+			writeAdminMutationError(w, err)
+			return
+		}
+		w.WriteHeader(http.StatusNoContent)
+	default:
+		w.Header().Set("Allow", "GET, POST, DELETE")
+		writeProblem(w, http.StatusMethodNotAllowed, "method not allowed", "")
+	}
+}
+func (a *App) handleLegacyAdminKeyAlias(w http.ResponseWriter, r *http.Request) {
+	if a.adminTokenEnv != "" && r.Method != http.MethodGet {
+		writeProblem(w, http.StatusConflict, "admin token is environment-managed", "ROOTER_ADMIN_TOKEN overrides persisted configuration")
+		return
+	}
+	switch r.Method {
+	case http.MethodGet:
+		writeJSON(w, http.StatusOK, map[string]any{"environment_managed": a.adminTokenEnv != "", "token": redactedSecret})
+	case http.MethodPost:
+		raw := generateRawAPIKey()
+		created := createStoredAPIKey(raw, "Legacy admin key", allAPIPermissions(), nil)
+		_, err := a.store.Update(func(cfg *Config) error {
+			newKeys := []APIKey{}
+			for _, k := range cfg.APIKeys {
+				if !hasAllPermissions(k.Permissions) {
+					newKeys = append(newKeys, k)
+				}
+			}
+			newKeys = append(newKeys, created)
+			cfg.APIKeys = newKeys
+			return nil
+		})
+		if err != nil {
+			writeAdminMutationError(w, err)
+			return
+		}
+		writeJSON(w, http.StatusCreated, map[string]string{"token": raw})
+	case http.MethodPut:
+		defer r.Body.Close()
+		var body struct {
+			Token string `json:"token"`
+		}
+		if err := decodeAdminJSON(w, r, &body); err != nil {
+			writeProblem(w, http.StatusBadRequest, "invalid JSON", err.Error())
+			return
+		}
+		raw := strings.TrimSpace(body.Token)
+		if raw == "" {
+			writeProblem(w, http.StatusBadRequest, "token required", "")
+			return
+		}
+		created := createStoredAPIKey(raw, "Legacy admin key", allAPIPermissions(), nil)
+		_, err := a.store.Update(func(cfg *Config) error {
+			newKeys := []APIKey{}
+			for _, k := range cfg.APIKeys {
+				if !hasAllPermissions(k.Permissions) {
+					newKeys = append(newKeys, k)
+				}
+			}
+			newKeys = append(newKeys, created)
+			cfg.APIKeys = newKeys
+			return nil
+		})
+		if err != nil {
+			writeAdminMutationError(w, err)
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]string{"token": raw})
+	default:
+		w.Header().Set("Allow", "GET, POST, PUT")
+		writeProblem(w, http.StatusMethodNotAllowed, "method not allowed", "")
+	}
+}
+func writeScopedAuthError(w http.ResponseWriter, status int, message string) {
+	w.Header().Set("WWW-Authenticate", `Bearer realm="rooter"`)
+	writeJSON(w, status, map[string]any{"error": map[string]any{"message": message, "type": "authentication_error"}})
+}

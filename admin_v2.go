@@ -2,6 +2,21 @@ package main
 
 import "strings"
 
+func mustReplace(html, old, new string, n int) string {
+	result := strings.Replace(html, old, new, n)
+	if result == html {
+		panic("mustReplace: anchor not found: " + old[:min(len(old), 50)])
+	}
+	return result
+}
+
+func min(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
+}
+
 var adminHTMLV2 = func() string {
 	html := adminHTML
 	oldAccess := `      <section>
@@ -48,10 +63,10 @@ var adminHTMLV2 = func() string {
 	html = strings.Replace(html, oldAccess, newAccess, 1)
 	html = strings.ReplaceAll(html, "Admin UI token", "API key")
 	html = strings.ReplaceAll(html, "Use token", "Use key")
-	html = strings.Replace(html, "      els.adminToken.value = state.config.admin_token || '';", "      els.adminToken.value = '';", 1)
-	html = strings.Replace(html, "      els.publicKeys.value = (state.config.public_api_keys || []).join('\\n');", "      els.publicKeys.value = '';", 1)
-	html = strings.Replace(html, "      state.config.admin_token = els.adminToken.value.trim();\n      state.config.public_api_keys = els.publicKeys.value.split(/\\n+/).map(v => v.trim()).filter(Boolean);", "      state.config.admin_token = '';\n      state.config.public_api_keys = [];", 1)
-	html = strings.Replace(html, "        rememberAdminToken(next.admin_token);\n", "", 1)
+	html = mustReplace(html, "      els.adminToken.value = state.config.admin_token || '';", "      els.adminToken.value = '';", 1)
+	html = mustReplace(html, "      els.publicKeys.value = (state.config.public_api_keys || []).join('\\n');", "      els.publicKeys.value = '';", 1)
+	html = mustReplace(html, "      state.config.admin_token = els.adminToken.value.trim();\n      state.config.public_api_keys = els.publicKeys.value.split(/\\n+/).map(v => v.trim()).filter(Boolean);", "      state.config.admin_token = '';\n      state.config.public_api_keys = [];", 1)
+	html = mustReplace(html, "        rememberAdminToken(next.admin_token);\n", "", 1)
 	html = strings.Replace(html, "        hydrateForm();\n        setStatus('Loaded', 'ok');", "        hydrateForm();\n        if (typeof refreshAPIKeys === 'function') refreshAPIKeys();\n        setStatus('Loaded', 'ok');", 1)
 
 	extra := `<script>
@@ -80,7 +95,7 @@ async function refreshAPIKeys() {
       box.appendChild(card);
     });
     if (!(result.data || []).length) box.innerHTML = '<div class="muted">No API keys configured.</div>';
-  } catch (_) {}
+  } catch (err) { setStatus(err.message, 'error'); }
 }
 
 document.getElementById('refreshAPIKeysBtn')?.addEventListener('click', refreshAPIKeys);
@@ -93,8 +108,19 @@ document.getElementById('createAPIKeyBtn')?.addEventListener('click', async () =
     const created = await api('/admin/api/api-keys', { method:'POST', body:JSON.stringify(body) });
     const secret = document.getElementById('newAPIKeySecret');
     secret.classList.remove('hidden');
-    secret.innerHTML = '<strong>Copy this key now. It will not be shown again.</strong><div class="field-row" style="margin-top:8px;"><input id="createdAPIKeyValue" readonly value="' + escapeHTML(created.key) + '"><button type="button" id="copyCreatedAPIKey">Copy</button></div>';
-    document.getElementById('copyCreatedAPIKey').addEventListener('click', () => navigator.clipboard.writeText(created.key));
+    secret.innerHTML = '<strong>Copy this key now. It will not be shown again.</strong><div class="field-row" style="margin-top:8px;"></div>';
+    const fieldRow = secret.querySelector('.field-row');
+    const input = document.createElement('input');
+    input.id = 'createdAPIKeyValue';
+    input.readOnly = true;
+    input.value = created.key;
+    fieldRow.appendChild(input);
+    const copyBtn = document.createElement('button');
+    copyBtn.type = 'button';
+    copyBtn.id = 'copyCreatedAPIKey';
+    copyBtn.textContent = 'Copy';
+    copyBtn.addEventListener('click', () => navigator.clipboard.writeText(created.key));
+    fieldRow.appendChild(copyBtn);
     document.getElementById('newAPIKeyName').value = '';
     await refreshAPIKeys();
   } catch (err) { setStatus(err.message, 'error'); }

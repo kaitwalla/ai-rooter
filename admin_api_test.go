@@ -43,7 +43,7 @@ func TestProviderAPIRedactsSecretAndRenameRewritesReferences(t *testing.T) {
 	})
 
 	req := httptest.NewRequest(http.MethodGet, "/admin/api/providers/p", nil)
-	authorizeAdmin(req, app)
+	authorizeAdmin(req)
 	rec := httptest.NewRecorder()
 	app.routes().ServeHTTP(rec, req)
 	if rec.Code != http.StatusOK {
@@ -55,7 +55,7 @@ func TestProviderAPIRedactsSecretAndRenameRewritesReferences(t *testing.T) {
 
 	req = httptest.NewRequest(http.MethodPatch, "/admin/api/providers/p", strings.NewReader(`{"id":"renamed"}`))
 	req.Header.Set("Content-Type", "application/json")
-	authorizeAdmin(req, app)
+	authorizeAdmin(req)
 	rec = httptest.NewRecorder()
 	app.routes().ServeHTTP(rec, req)
 	if rec.Code != http.StatusOK {
@@ -84,7 +84,7 @@ func TestChainAndModelCRUD(t *testing.T) {
 
 	req := httptest.NewRequest(http.MethodPatch, "/admin/api/chains/coding", strings.NewReader(`{"name":"Coding Prime"}`))
 	req.Header.Set("Content-Type", "application/json")
-	authorizeAdmin(req, app)
+	authorizeAdmin(req)
 	rec := httptest.NewRecorder()
 	app.routes().ServeHTTP(rec, req)
 	if rec.Code != http.StatusOK {
@@ -93,7 +93,7 @@ func TestChainAndModelCRUD(t *testing.T) {
 
 	req = httptest.NewRequest(http.MethodPatch, "/admin/api/models/Direct", strings.NewReader(`{"enabled":false,"upstream_name":"direct-v2"}`))
 	req.Header.Set("Content-Type", "application/json")
-	authorizeAdmin(req, app)
+	authorizeAdmin(req)
 	rec = httptest.NewRecorder()
 	app.routes().ServeHTTP(rec, req)
 	if rec.Code != http.StatusOK {
@@ -112,11 +112,11 @@ func TestChainAndModelCRUD(t *testing.T) {
 func TestDeletingReferencedProviderIsRejected(t *testing.T) {
 	app := testApp(t, Config{
 		Providers: []Provider{{ID: "p", Name: "Provider", Type: "openai", BaseURL: "http://example.test/v1", Enabled: true}},
-		Models: []ModelMapping{{PublicName: "Direct", ProviderID: "p", UpstreamName: "direct", Enabled: true}},
+		Models:    []ModelMapping{{PublicName: "Direct", ProviderID: "p", UpstreamName: "direct", Enabled: true}},
 	})
 
 	req := httptest.NewRequest(http.MethodDelete, "/admin/api/providers/p", nil)
-	authorizeAdmin(req, app)
+	authorizeAdmin(req)
 	rec := httptest.NewRecorder()
 	app.routes().ServeHTTP(rec, req)
 	if rec.Code != http.StatusBadRequest {
@@ -127,28 +127,30 @@ func TestDeletingReferencedProviderIsRejected(t *testing.T) {
 	}
 }
 
-func TestPublicAPIKeyManagement(t *testing.T) {
+func TestLegacyPublicKeyAliasAndScopedAPIKeys(t *testing.T) {
 	app := testApp(t, Config{
 		Providers: []Provider{{ID: "p", Name: "Provider", Type: "openai", BaseURL: "http://example.test/v1", Enabled: true}},
 	})
 
 	req := httptest.NewRequest(http.MethodPost, "/admin/api/public-api-keys", strings.NewReader(`{}`))
 	req.Header.Set("Content-Type", "application/json")
-	authorizeAdmin(req, app)
+	authorizeAdmin(req)
 	rec := httptest.NewRecorder()
 	app.routes().ServeHTTP(rec, req)
 	if rec.Code != http.StatusCreated {
 		t.Fatalf("create status = %d body = %s", rec.Code, rec.Body.String())
 	}
 	var created map[string]string
-	if err := json.Unmarshal(rec.Body.Bytes(), &created); err != nil { t.Fatal(err) }
+	if err := json.Unmarshal(rec.Body.Bytes(), &created); err != nil {
+		t.Fatal(err)
+	}
 	if !strings.HasPrefix(created["key"], "rtk_") {
 		t.Fatalf("generated key = %q", created["key"])
 	}
 
 	req = httptest.NewRequest(http.MethodDelete, "/admin/api/public-api-keys", strings.NewReader(`{"key":"`+created["key"]+`"}`))
 	req.Header.Set("Content-Type", "application/json")
-	authorizeAdmin(req, app)
+	authorizeAdmin(req)
 	rec = httptest.NewRecorder()
 	app.routes().ServeHTTP(rec, req)
 	if rec.Code != http.StatusNoContent {
@@ -160,13 +162,22 @@ func TestPublicAPIKeyManagement(t *testing.T) {
 			t.Fatalf("deleted key is still present: %#v", key)
 		}
 	}
+
+	req = httptest.NewRequest(http.MethodPost, "/admin/api/api-keys", strings.NewReader(`{"name":"Test key"}`))
+	req.Header.Set("Content-Type", "application/json")
+	authorizeAdmin(req)
+	rec = httptest.NewRecorder()
+	app.routes().ServeHTTP(rec, req)
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("api-keys create status = %d body = %s", rec.Code, rec.Body.String())
+	}
 }
 
 func postJSON(t *testing.T, app *App, path, body string, want int) {
 	t.Helper()
 	req := httptest.NewRequest(http.MethodPost, path, strings.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
-	authorizeAdmin(req, app)
+	authorizeAdmin(req)
 	rec := httptest.NewRecorder()
 	app.routes().ServeHTTP(rec, req)
 	if rec.Code != want {

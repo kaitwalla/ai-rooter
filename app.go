@@ -46,7 +46,7 @@ func (a *App) routes() http.Handler {
 	mux.HandleFunc("/v1/models", a.handleModels)
 	mux.HandleFunc("/v1/models/", a.handleModel)
 	mux.HandleFunc("/v1/", a.handleProxy)
-	return a.scopedAuthMiddleware(logRequests(mux))
+	return logRequests(a.scopedAuthMiddleware(mux))
 }
 
 func (a *App) handleHealth(w http.ResponseWriter, r *http.Request) {
@@ -812,6 +812,10 @@ type statusRecorder struct {
 func (r *statusRecorder) WriteHeader(status int) {
 	r.status = status
 	r.ResponseWriter.WriteHeader(status)
+}
+
+func (r *statusRecorder) Unwrap() http.ResponseWriter {
+	return r.ResponseWriter
 }
 
 func writeJSON(w http.ResponseWriter, status int, value any) {
