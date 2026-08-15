@@ -2,6 +2,7 @@ package main
 
 import (
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -18,22 +19,65 @@ import (
 
 const redactedSecret = "********"
 
+const (
+	internalPublicAuthSentinel = "__rooter_scoped_public_auth__"
+	internalAdminAuthSentinel  = "__rooter_scoped_admin_auth__"
+)
+
 type Config struct {
-	PublicAPIKeys []string       `json:"public_api_keys"`
-	AdminToken    string         `json:"admin_token"`
+	PublicAPIKeys []string       `json:"public_api_keys,omitempty"`
+	AdminToken    string         `json:"admin_token,omitempty"`
+	APIKeys       []APIKey       `json:"api_keys,omitempty"`
 	Providers     []Provider     `json:"providers"`
 	Chains        []ModelChain   `json:"chains,omitempty"`
 	Models        []ModelMapping `json:"models"`
 	UpdatedAt     time.Time      `json:"updated_at"`
 }
 
+type APIKey struct {
+	ID          string     `json:"id"`
+	Name        string     `json:"name"`
+	Prefix      string     `json:"prefix"`
+	Hash        string     `json:"hash"`
+	Permissions []string   `json:"permissions"`
+	Enabled     bool       `json:"enabled"`
+	CreatedAt   time.Time  `json:"created_at"`
+	ExpiresAt   *time.Time `json:"expires_at,omitempty"`
+	LastUsedAt  *time.Time `json:"last_used_at,omitempty"`
+}
+
 type Provider struct {
-	ID      string `json:"id"`
-	Name    string `json:"name"`
-	Type    string `json:"type"`
-	BaseURL string `json:"base_url"`
-	APIKey  string `json:"api_key"`
-	Enabled bool   `json:"enabled"`
+	ID, Name, Type, BaseURL, APIKey string
+	Enabled                         bool
+}
+
+func (p Provider) MarshalJSON() ([]byte, error) {
+	type wire struct {
+		ID      string `json:"id"`
+		Name    string `json:"name"`
+		Type    string `json:"type"`
+		BaseURL string `json:"base_url"`
+		APIKey  string `json:"api_key"`
+		Enabled bool   `json:"enabled"`
+	}
+	w := wire{ID: p.ID, Name: p.Name, Type: p.Type, BaseURL: p.BaseURL, APIKey: p.APIKey, Enabled: p.Enabled}
+	return json.Marshal(w)
+}
+func (p *Provider) UnmarshalJSON(b []byte) error {
+	type wire struct {
+		ID      string `json:"id"`
+		Name    string `json:"name"`
+		Type    string `json:"type"`
+		BaseURL string `json:"base_url"`
+		APIKey  string `json:"api_key"`
+		Enabled bool   `json:"enabled"`
+	}
+	var w wire
+	if err := json.Unmarshal(b, &w); err != nil {
+		return err
+	}
+	p.ID, p.Name, p.Type, p.BaseURL, p.APIKey, p.Enabled = w.ID, w.Name, w.Type, w.BaseURL, w.APIKey, w.Enabled
+	return nil
 }
 
 type ModelMapping struct {
@@ -45,46 +89,44 @@ type ModelMapping struct {
 	Enabled      bool        `json:"enabled"`
 	Order        int         `json:"order"`
 }
-
 type ModelChain struct {
 	ID    string      `json:"id"`
 	Name  string      `json:"name"`
 	Steps []ChainStep `json:"steps"`
 	Order int         `json:"order"`
 }
-
 type ChainStep struct {
 	ProviderID   string `json:"provider_id"`
 	UpstreamName string `json:"upstream_name"`
 }
 
 type Store struct {
-	path string
-	mu   sync.RWMutex
-	cfg  Config
+	path         string
+	mu           sync.RWMutex
+	cfg          Config
+	scopedBridge bool
 }
 
 func NewStore(path string) (*Store, error) {
-	store := &Store{path: path}
-	if err := store.load(); err != nil {
+	s := &Store{path: path}
+	if err := s.load(); err != nil {
 		return nil, err
 	}
-	return store, nil
+	return s, nil
 }
-
-func (s *Store) Snapshot() Config {
+func (s *Store) EnableScopedAuthBridge() { s.mu.Lock(); s.scopedBridge = true; s.mu.Unlock() }
+func (s *Store) ScopedAuthBridgeEnabled() bool {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	return cloneConfig(s.cfg)
+	return s.scopedBridge
 }
-
+func (s *Store) Snapshot() Config { s.mu.RLock(); defer s.mu.RUnlock(); return cloneConfig(s.cfg) }
 func (s *Store) Replace(next Config) error {
 	normalized, err := normalizeConfig(next)
 	if err != nil {
 		return err
 	}
 	normalized.UpdatedAt = time.Now().UTC()
-
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if err := writeConfigAtomic(s.path, normalized); err != nil {
@@ -96,19 +138,9 @@ func (s *Store) Replace(next Config) error {
 
 func (s *Store) load() error {
 	if _, err := os.Stat(s.path); errors.Is(err, os.ErrNotExist) {
-		cfg := Config{
-			AdminToken: generateAdminToken(),
-			Providers: []Provider{
-				{
-					ID:      "local-ollama",
-					Name:    "Local Ollama",
-					Type:    "ollama",
-					BaseURL: "http://localhost:11434/api",
-					Enabled: true,
-				},
-			},
-			Models: []ModelMapping{},
-		}
+		bootstrap := generateRawAPIKey()
+		cfg := Config{AdminToken: bootstrap, Providers: []Provider{{ID: "local-ollama", Name: "Local Ollama", Type: "ollama", BaseURL: "http://localhost:11434/api", Enabled: true}}, Models: []ModelMapping{}}
+		fmt.Fprintf(os.Stderr, "Rooter bootstrap API key (save it now): %s\n", bootstrap)
 		normalized, err := normalizeConfig(cfg)
 		if err != nil {
 			return err
@@ -122,7 +154,6 @@ func (s *Store) load() error {
 	} else if err != nil {
 		return err
 	}
-
 	data, err := os.ReadFile(s.path)
 	if err != nil {
 		return err
@@ -131,14 +162,17 @@ func (s *Store) load() error {
 	if err := json.Unmarshal(data, &cfg); err != nil {
 		return fmt.Errorf("read config %s: %w", s.path, err)
 	}
+	if len(cfg.APIKeys) == 0 && len(cfg.PublicAPIKeys) == 0 && strings.TrimSpace(cfg.AdminToken) == "" {
+		bootstrap := generateRawAPIKey()
+		cfg.AdminToken = bootstrap
+		fmt.Fprintf(os.Stderr, "Rooter bootstrap API key (save it now): %s\n", bootstrap)
+	}
 	normalized, err := normalizeConfig(cfg)
 	if err != nil {
 		return err
 	}
-	if normalized.AdminToken != cfg.AdminToken {
-		if err := writeConfigAtomic(s.path, normalized); err != nil {
-			return err
-		}
+	if err := writeConfigAtomic(s.path, normalized); err != nil {
+		return err
 	}
 	s.cfg = normalized
 	return nil
@@ -146,10 +180,13 @@ func (s *Store) load() error {
 
 func normalizeConfig(cfg Config) (Config, error) {
 	cfg.AdminToken = strings.TrimSpace(cfg.AdminToken)
-	if cfg.AdminToken == "" {
-		cfg.AdminToken = generateAdminToken()
-	}
 	cfg.PublicAPIKeys = compactUnique(cfg.PublicAPIKeys)
+	if cfg.APIKeys == nil {
+		cfg.APIKeys = []APIKey{}
+	}
+	migrateLegacyCredentials(&cfg)
+	cfg.PublicAPIKeys = nil
+	cfg.AdminToken = ""
 	if cfg.Providers == nil {
 		cfg.Providers = []Provider{}
 	}
@@ -159,7 +196,36 @@ func normalizeConfig(cfg Config) (Config, error) {
 	if cfg.Models == nil {
 		cfg.Models = []ModelMapping{}
 	}
-
+	keyIDs := map[string]bool{}
+	for i := range cfg.APIKeys {
+		k := &cfg.APIKeys[i]
+		k.ID = slugify(k.ID)
+		k.Name = strings.TrimSpace(k.Name)
+		k.Prefix = strings.TrimSpace(k.Prefix)
+		k.Hash = strings.ToLower(strings.TrimSpace(k.Hash))
+		k.Permissions = compactUnique(k.Permissions)
+		if k.ID == "" {
+			k.ID = fmt.Sprintf("key-%d", i+1)
+		}
+		if keyIDs[k.ID] {
+			return cfg, fmt.Errorf("duplicate API key id %q", k.ID)
+		}
+		keyIDs[k.ID] = true
+		if k.Name == "" {
+			k.Name = k.ID
+		}
+		if k.Hash == "" {
+			return cfg, fmt.Errorf("API key %q is missing its hash", k.ID)
+		}
+		if k.CreatedAt.IsZero() {
+			k.CreatedAt = time.Now().UTC()
+		}
+		for _, p := range k.Permissions {
+			if !validAPIPermission(p) {
+				return cfg, fmt.Errorf("API key %q has unknown permission %q", k.ID, p)
+			}
+		}
+	}
 	providerIDs := map[string]bool{}
 	for i := range cfg.Providers {
 		p := &cfg.Providers[i]
@@ -196,7 +262,6 @@ func normalizeConfig(cfg Config) (Config, error) {
 			return cfg, fmt.Errorf("provider %q has invalid base URL: %w", p.ID, err)
 		}
 	}
-
 	chainIDs := map[string]bool{}
 	modelKeys := map[string]bool{}
 	for i := range cfg.Chains {
@@ -222,13 +287,13 @@ func normalizeConfig(cfg Config) (Config, error) {
 		}
 		modelKeys[key] = true
 		for j := range c.Steps {
-			step := &c.Steps[j]
-			step.ProviderID = slugify(step.ProviderID)
-			step.UpstreamName = strings.TrimSpace(step.UpstreamName)
-			if step.ProviderID == "" || !providerIDs[step.ProviderID] {
-				return cfg, fmt.Errorf("chain %q step %d references unknown provider %q", c.Name, j+1, step.ProviderID)
+			s := &c.Steps[j]
+			s.ProviderID = slugify(s.ProviderID)
+			s.UpstreamName = strings.TrimSpace(s.UpstreamName)
+			if s.ProviderID == "" || !providerIDs[s.ProviderID] {
+				return cfg, fmt.Errorf("chain %q step %d references unknown provider %q", c.Name, j+1, s.ProviderID)
 			}
-			if step.UpstreamName == "" {
+			if s.UpstreamName == "" {
 				return cfg, fmt.Errorf("chain %q step %d needs an upstream model", c.Name, j+1)
 			}
 		}
@@ -242,7 +307,6 @@ func normalizeConfig(cfg Config) (Config, error) {
 	for i := range cfg.Chains {
 		cfg.Chains[i].Order = i + 1
 	}
-
 	for i := range cfg.Models {
 		m := &cfg.Models[i]
 		m.PublicName = strings.TrimSpace(m.PublicName)
@@ -256,9 +320,9 @@ func normalizeConfig(cfg Config) (Config, error) {
 			return cfg, fmt.Errorf("model %q references unknown chain %q", m.PublicName, m.ChainID)
 		}
 		if m.ChainID != "" && (m.ProviderID == "" || m.UpstreamName == "") {
-			if chain, ok := findConfigChain(cfg.Chains, m.ChainID); ok && len(chain.Steps) > 0 {
-				m.ProviderID = chain.Steps[0].ProviderID
-				m.UpstreamName = chain.Steps[0].UpstreamName
+			if c, ok := findConfigChain(cfg.Chains, m.ChainID); ok && len(c.Steps) > 0 {
+				m.ProviderID = c.Steps[0].ProviderID
+				m.UpstreamName = c.Steps[0].UpstreamName
 			}
 		}
 		if m.ProviderID == "" || !providerIDs[m.ProviderID] {
@@ -268,13 +332,13 @@ func normalizeConfig(cfg Config) (Config, error) {
 			m.UpstreamName = m.PublicName
 		}
 		for j := range m.Chain {
-			step := &m.Chain[j]
-			step.ProviderID = slugify(step.ProviderID)
-			step.UpstreamName = strings.TrimSpace(step.UpstreamName)
-			if step.ProviderID == "" || !providerIDs[step.ProviderID] {
-				return cfg, fmt.Errorf("model %q chain step %d references unknown provider %q", m.PublicName, j+1, step.ProviderID)
+			s := &m.Chain[j]
+			s.ProviderID = slugify(s.ProviderID)
+			s.UpstreamName = strings.TrimSpace(s.UpstreamName)
+			if s.ProviderID == "" || !providerIDs[s.ProviderID] {
+				return cfg, fmt.Errorf("model %q chain step %d references unknown provider %q", m.PublicName, j+1, s.ProviderID)
 			}
-			if step.UpstreamName == "" {
+			if s.UpstreamName == "" {
 				return cfg, fmt.Errorf("model %q chain step %d needs an upstream model", m.PublicName, j+1)
 			}
 		}
@@ -299,12 +363,46 @@ func normalizeConfig(cfg Config) (Config, error) {
 	return cfg, nil
 }
 
-func generateAdminToken() string {
-	var bytes [32]byte
-	if _, err := rand.Read(bytes[:]); err != nil {
-		panic(fmt.Sprintf("generate admin token: %v", err))
+func migrateLegacyCredentials(cfg *Config) {
+	now := time.Now().UTC()
+	for i, raw := range cfg.PublicAPIKeys {
+		raw = strings.TrimSpace(raw)
+		if raw == "" || raw == internalPublicAuthSentinel {
+			continue
+		}
+		appendMigratedAPIKey(cfg, raw, fmt.Sprintf("Migrated API key %d", i+1), publicAPIPermissions(), now)
 	}
-	return "rta_" + hex.EncodeToString(bytes[:])
+	if raw := strings.TrimSpace(cfg.AdminToken); raw != "" && raw != internalAdminAuthSentinel {
+		appendMigratedAPIKey(cfg, raw, "Migrated admin key", allAPIPermissions(), now)
+	}
+}
+func appendMigratedAPIKey(cfg *Config, raw, name string, permissions []string, now time.Time) {
+	hash := hashAPIKey(raw)
+	for _, k := range cfg.APIKeys {
+		if k.Hash == hash {
+			return
+		}
+	}
+	cfg.APIKeys = append(cfg.APIKeys, APIKey{ID: fmt.Sprintf("migrated-%d", len(cfg.APIKeys)+1), Name: name, Prefix: "legacy", Hash: hash, Permissions: permissions, Enabled: true, CreatedAt: now})
+}
+func hashAPIKey(raw string) string {
+	sum := sha256.Sum256([]byte(raw))
+	return hex.EncodeToString(sum[:])
+}
+func generateAdminToken() string { return generateRawAPIKey() }
+func generateRawAPIKey() string {
+	var b [32]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		panic(fmt.Sprintf("generate API key: %v", err))
+	}
+	return "rtk_" + hex.EncodeToString(b[:])
+}
+func generateAPIKeyID() string {
+	var b [8]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		panic(fmt.Sprintf("generate API key ID: %v", err))
+	}
+	return "key-" + hex.EncodeToString(b[:])
 }
 
 func validateProviderBaseURL(raw string) error {
@@ -327,7 +425,6 @@ func validateProviderBaseURL(raw string) error {
 	}
 	return nil
 }
-
 func isBlockedLinkLocalHost(host string) bool {
 	if strings.EqualFold(host, "metadata.google.internal") {
 		return true
@@ -337,16 +434,15 @@ func isBlockedLinkLocalHost(host string) bool {
 	}
 	return false
 }
-
-func isLinkLocalMetadataIP(ip netip.Addr) bool {
-	return ip.IsLinkLocalUnicast()
-}
-
+func isLinkLocalMetadataIP(ip netip.Addr) bool { return ip.IsLinkLocalUnicast() }
 func writeConfigAtomic(path string, cfg Config) error {
-	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
 		return err
 	}
-	data, err := json.MarshalIndent(cfg, "", "  ")
+	persisted := cloneConfig(cfg)
+	persisted.PublicAPIKeys = nil
+	persisted.AdminToken = ""
+	data, err := json.MarshalIndent(persisted, "", "  ")
 	if err != nil {
 		return err
 	}
@@ -357,10 +453,13 @@ func writeConfigAtomic(path string, cfg Config) error {
 	}
 	return os.Rename(tmp, path)
 }
-
 func cloneConfig(cfg Config) Config {
 	out := cfg
 	out.PublicAPIKeys = slices.Clone(cfg.PublicAPIKeys)
+	out.APIKeys = slices.Clone(cfg.APIKeys)
+	for i := range out.APIKeys {
+		out.APIKeys[i].Permissions = slices.Clone(cfg.APIKeys[i].Permissions)
+	}
 	out.Providers = slices.Clone(cfg.Providers)
 	out.Chains = slices.Clone(cfg.Chains)
 	for i := range out.Chains {
@@ -372,31 +471,28 @@ func cloneConfig(cfg Config) Config {
 	}
 	return out
 }
-
 func findConfigChain(chains []ModelChain, id string) (ModelChain, bool) {
 	id = slugify(id)
-	for _, chain := range chains {
-		if chain.ID == id {
-			return chain, true
+	for _, c := range chains {
+		if c.ID == id {
+			return c, true
 		}
 	}
 	return ModelChain{}, false
 }
-
 func compactUnique(values []string) []string {
 	seen := map[string]bool{}
 	out := make([]string, 0, len(values))
-	for _, value := range values {
-		value = strings.TrimSpace(value)
-		if value == "" || seen[value] {
+	for _, v := range values {
+		v = strings.TrimSpace(v)
+		if v == "" || seen[v] {
 			continue
 		}
-		seen[value] = true
-		out = append(out, value)
+		seen[v] = true
+		out = append(out, v)
 	}
 	return out
 }
-
 func slugify(value string) string {
 	value = strings.TrimSpace(strings.ToLower(value))
 	var b strings.Builder

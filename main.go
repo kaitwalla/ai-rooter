@@ -52,29 +52,46 @@ func main() {
 	}
 
 	app := NewApp(store, os.Getenv("ROOTER_ADMIN_TOKEN"))
-	server := &http.Server{
-		Addr:    *addr,
-		Handler: app.routes(),
+	timeout, err := rooterUpstreamTimeout(os.Getenv("ROOTER_UPSTREAM_TIMEOUT"))
+	if err != nil {
+		log.Fatalf("ROOTER_UPSTREAM_TIMEOUT: %v", err)
 	}
+	app.client.Timeout = timeout
+
+	handler := sseFlushMiddleware(app.routes())
+	server := &http.Server{Addr: *addr, Handler: handler, ReadHeaderTimeout: 10 * time.Second}
 
 	log.Printf("rooter listening on %s", *addr)
 	log.Printf("settings: %s", *configPath)
+	log.Printf("upstream timeout: %s", timeout)
 	if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 		log.Fatalf("server: %v", err)
 	}
 }
 
+func rooterUpstreamTimeout(raw string) (time.Duration, error) {
+	raw = envOrValue(raw, "5m")
+	d, err := time.ParseDuration(raw)
+	if err != nil {
+		return 0, fmt.Errorf("must be a Go duration such as 20m: %w", err)
+	}
+	if d <= 0 {
+		return 0, fmt.Errorf("must be greater than zero")
+	}
+	return d, nil
+}
+
+func envOrValue(value, fallback string) string {
+	if value != "" {
+		return value
+	}
+	return fallback
+}
+
 func updateExecutable(repo, assetName string) (bool, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 	defer cancel()
-	return updateFromGitHub(ctx, updateOptions{
-		Repository: repo,
-		AssetName:  assetName,
-		Version:    version,
-		Client: &http.Client{
-			Timeout: 5 * time.Minute,
-		},
-	})
+	return updateFromGitHub(ctx, updateOptions{Repository: repo, AssetName: assetName, Version: version, Client: &http.Client{Timeout: 5 * time.Minute}})
 }
 
 func envOr(key, fallback string) string {
@@ -83,7 +100,6 @@ func envOr(key, fallback string) string {
 	}
 	return fallback
 }
-
 func defaultConfigPath() string {
 	if dir, err := os.UserConfigDir(); err == nil && dir != "" {
 		return filepath.Join(dir, "rooter", "config.json")

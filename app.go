@@ -24,6 +24,7 @@ type App struct {
 }
 
 func NewApp(store *Store, adminTokenEnv string) *App {
+	store.EnableScopedAuthBridge()
 	return &App{
 		store:         store,
 		adminTokenEnv: strings.TrimSpace(adminTokenEnv),
@@ -40,11 +41,12 @@ func (a *App) routes() http.Handler {
 	mux.HandleFunc("/admin/api/config", a.requireAdmin(a.handleAdminConfig))
 	mux.HandleFunc("/admin/api/activate", a.requireAdmin(a.handleActivate))
 	mux.HandleFunc("/admin/api/discover", a.requireAdmin(a.handleDiscover))
+	a.registerAdminAPI(mux)
 	mux.HandleFunc("/healthz", a.handleHealth)
 	mux.HandleFunc("/v1/models", a.handleModels)
 	mux.HandleFunc("/v1/models/", a.handleModel)
 	mux.HandleFunc("/v1/", a.handleProxy)
-	return logRequests(mux)
+	return logRequests(a.scopedAuthMiddleware(mux))
 }
 
 func (a *App) handleHealth(w http.ResponseWriter, r *http.Request) {
@@ -508,16 +510,22 @@ func (a *App) adminToken() string {
 	if a.adminTokenEnv != "" {
 		return a.adminTokenEnv
 	}
+	if a.store.ScopedAuthBridgeEnabled() {
+		return internalAdminAuthSentinel
+	}
 	return a.store.Snapshot().AdminToken
 }
 
 func (a *App) requirePublicAPIKey(w http.ResponseWriter, r *http.Request) bool {
+	token := bearerToken(r.Header.Get("Authorization"))
+	if a.store.ScopedAuthBridgeEnabled() && token == internalPublicAuthSentinel {
+		return true
+	}
 	cfg := a.store.Snapshot()
 	if len(cfg.PublicAPIKeys) == 0 {
 		writeOpenAIError(w, http.StatusUnauthorized, "invalid_api_key", "no public API keys are configured")
 		return false
 	}
-	token := bearerToken(r.Header.Get("Authorization"))
 	if slices.Contains(cfg.PublicAPIKeys, token) {
 		return true
 	}
