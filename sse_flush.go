@@ -1,8 +1,6 @@
 package main
 
 import (
-	"bufio"
-	"net"
 	"net/http"
 	"strings"
 )
@@ -17,7 +15,6 @@ func (w *sseFlushWriter) Write(p []byte) (int,error) {
 	return n,err
 }
 func (w *sseFlushWriter) Flush(){ if f,ok:=w.ResponseWriter.(http.Flusher);ok{f.Flush()} }
-func (w *sseFlushWriter) Hijack()(net.Conn,*bufio.ReadWriter,error){ return w.ResponseWriter.(http.Hijacker).Hijack() }
 
 func sseFlushMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter,r *http.Request){ next.ServeHTTP(&sseFlushWriter{ResponseWriter:w},r) })
