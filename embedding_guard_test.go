@@ -32,6 +32,24 @@ func TestEmbeddingGuardRejectsDifferentFallbackModel(t *testing.T) {
 	}
 }
 
+func TestEmbeddingGuardAllowsIndependentRequests(t *testing.T) {
+	req1 := httptest.NewRequest("POST", "/v1/embeddings", nil)
+	req2 := httptest.NewRequest("POST", "/v1/embeddings", nil)
+
+	if err := guardEmbeddingModel(req1, "model-a"); err != nil {
+		t.Fatalf("req1 first call: %v", err)
+	}
+	if err := guardEmbeddingModel(req2, "model-b"); err != nil {
+		t.Fatalf("req2 first call: %v", err)
+	}
+	if err := guardEmbeddingModel(req1, "model-a"); err != nil {
+		t.Fatalf("req1 second call: %v", err)
+	}
+	if err := guardEmbeddingModel(req2, "model-b"); err != nil {
+		t.Fatalf("req2 second call: %v", err)
+	}
+}
+
 func TestEmbeddingRequestPaths(t *testing.T) {
 	if !isEmbeddingRequestPath("/v1/embeddings") || !isEmbeddingRequestPath("/api/embed") {
 		t.Fatal("expected embedding paths to be recognized")

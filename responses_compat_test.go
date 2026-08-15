@@ -27,20 +27,34 @@ func TestResponsesRequestToChatTranslatesInstructionsAndTools(t *testing.T) {
 	if err := json.Unmarshal(out, &payload); err != nil {
 		t.Fatal(err)
 	}
-	messages := payload["messages"].([]any)
-	if len(messages) != 2 {
+	messages, ok := payload["messages"].([]any)
+	if !ok || len(messages) != 2 {
 		t.Fatalf("messages = %#v", messages)
 	}
-	if messages[0].(map[string]any)["role"] != "developer" || messages[1].(map[string]any)["role"] != "user" {
+	msg0, ok0 := messages[0].(map[string]any)
+	msg1, ok1 := messages[1].(map[string]any)
+	if !ok0 || !ok1 || msg0["role"] != "developer" || msg1["role"] != "user" {
 		t.Fatalf("roles = %#v", messages)
 	}
-	if payload["max_tokens"].(float64) != 2048 {
+	maxTokens, ok := payload["max_tokens"].(float64)
+	if !ok || maxTokens != 2048 {
 		t.Fatalf("max_tokens = %#v", payload["max_tokens"])
 	}
 	if payload["reasoning_effort"] != "high" {
 		t.Fatalf("reasoning_effort = %#v", payload["reasoning_effort"])
 	}
-	tool := payload["tools"].([]any)[0].(map[string]any)["function"].(map[string]any)
+	tools, ok := payload["tools"].([]any)
+	if !ok || len(tools) == 0 {
+		t.Fatalf("tools = %#v", payload["tools"])
+	}
+	tool0, ok := tools[0].(map[string]any)
+	if !ok {
+		t.Fatalf("tool[0] = %#v", tools[0])
+	}
+	tool, ok := tool0["function"].(map[string]any)
+	if !ok {
+		t.Fatalf("tool function = %#v", tool0["function"])
+	}
 	if tool["name"] != "read_file" {
 		t.Fatalf("tool = %#v", tool)
 	}
@@ -62,14 +76,24 @@ func TestResponsesFunctionCallRoundTripInput(t *testing.T) {
 	if err := json.Unmarshal(out, &payload); err != nil {
 		t.Fatal(err)
 	}
-	messages := payload["messages"].([]any)
-	assistant := messages[0].(map[string]any)
-	call := assistant["tool_calls"].([]any)[0].(map[string]any)
-	if call["id"] != "call_123" {
-		t.Fatalf("call id = %#v", call["id"])
+	messages, ok := payload["messages"].([]any)
+	if !ok || len(messages) < 2 {
+		t.Fatalf("messages = %#v", payload["messages"])
 	}
-	tool := messages[1].(map[string]any)
-	if tool["tool_call_id"] != "call_123" || tool["content"] != "package main" {
+	assistant, ok := messages[0].(map[string]any)
+	if !ok {
+		t.Fatalf("assistant = %#v", messages[0])
+	}
+	toolCalls, ok := assistant["tool_calls"].([]any)
+	if !ok || len(toolCalls) == 0 {
+		t.Fatalf("tool_calls = %#v", assistant["tool_calls"])
+	}
+	call, ok := toolCalls[0].(map[string]any)
+	if !ok || call["id"] != "call_123" {
+		t.Fatalf("call id = %#v", call)
+	}
+	tool, ok := messages[1].(map[string]any)
+	if !ok || tool["tool_call_id"] != "call_123" || tool["content"] != "package main" {
 		t.Fatalf("tool message = %#v", tool)
 	}
 }
@@ -78,8 +102,8 @@ func TestChatResponseAsResponsesPreservesTextToolsAndUsage(t *testing.T) {
 	chat := map[string]any{
 		"model": "coding-real",
 		"choices": []any{map[string]any{"message": map[string]any{
-			"content": "I need a file.",
-			"tool_calls": []any{map[string]any{"id":"call_7","type":"function","function":map[string]any{"name":"read_file","arguments":"{\"path\":\"x.go\"}"}}},
+			"content":    "I need a file.",
+			"tool_calls": []any{map[string]any{"id": "call_7", "type": "function", "function": map[string]any{"name": "read_file", "arguments": "{\"path\":\"x.go\"}"}}},
 		}}},
 		"usage": map[string]any{"prompt_tokens": 10, "completion_tokens": 5},
 	}
@@ -87,24 +111,60 @@ func TestChatResponseAsResponsesPreservesTextToolsAndUsage(t *testing.T) {
 	if out["object"] != "response" || out["status"] != "completed" {
 		t.Fatalf("response = %#v", out)
 	}
-	items := out["output"].([]any)
-	if len(items) != 2 {
-		t.Fatalf("output = %#v", items)
+	items, ok := out["output"].([]any)
+	if !ok || len(items) != 2 {
+		t.Fatalf("output = %#v", out["output"])
 	}
-	call := items[1].(map[string]any)
-	if call["type"] != "function_call" || call["call_id"] != "call_7" || call["name"] != "read_file" {
+	call, ok := items[1].(map[string]any)
+	if !ok || call["type"] != "function_call" || call["call_id"] != "call_7" || call["name"] != "read_file" {
 		t.Fatalf("call = %#v", call)
 	}
-	usage := out["usage"].(map[string]any)
-	if usage["input_tokens"].(int64) != 10 || usage["output_tokens"].(int64) != 5 {
+	usage, ok := out["usage"].(map[string]any)
+	if !ok {
+		t.Fatalf("usage = %#v", out["usage"])
+	}
+	inputTokens, ok1 := usage["input_tokens"].(int64)
+	outputTokens, ok2 := usage["output_tokens"].(int64)
+	if !ok1 || !ok2 || inputTokens != 10 || outputTokens != 5 {
 		t.Fatalf("usage = %#v", usage)
 	}
 }
 
 func TestResponsesUnsupportedStatefulFieldsFailClearly(t *testing.T) {
-	_, _, err := responsesRequestToChat([]byte(`{"model":"x","previous_response_id":"resp_old","input":"hi"}`))
-	if err == nil || !strings.Contains(err.Error(), "previous_response_id") {
-		t.Fatalf("err = %v", err)
+	cases := []struct {
+		name    string
+		body    string
+		wantErr string
+	}{
+		{
+			name:    "previous_response_id",
+			body:    `{"model":"x","previous_response_id":"resp_old","input":"hi"}`,
+			wantErr: "previous_response_id",
+		},
+		{
+			name:    "background true",
+			body:    `{"model":"x","background":true,"input":"hi"}`,
+			wantErr: "background",
+		},
+		{
+			name:    "background false",
+			body:    `{"model":"x","background":false,"input":"hi"}`,
+			wantErr: "",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			_, _, err := responsesRequestToChat([]byte(tc.body))
+			if tc.wantErr != "" {
+				if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
+					t.Errorf("err = %v, want %q", err, tc.wantErr)
+				}
+			} else {
+				if err != nil {
+					t.Errorf("unexpected err = %v", err)
+				}
+			}
+		})
 	}
 }
 
