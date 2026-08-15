@@ -24,6 +24,7 @@ type App struct {
 }
 
 func NewApp(store *Store, adminTokenEnv string) *App {
+	store.EnableScopedAuthBridge()
 	return &App{
 		store:         store,
 		adminTokenEnv: strings.TrimSpace(adminTokenEnv),
@@ -45,7 +46,7 @@ func (a *App) routes() http.Handler {
 	mux.HandleFunc("/v1/models", a.handleModels)
 	mux.HandleFunc("/v1/models/", a.handleModel)
 	mux.HandleFunc("/v1/", a.handleProxy)
-	return logRequests(mux)
+	return a.scopedAuthMiddleware(logRequests(mux))
 }
 
 func (a *App) handleHealth(w http.ResponseWriter, r *http.Request) {

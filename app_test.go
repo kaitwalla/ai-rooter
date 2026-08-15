@@ -537,11 +537,14 @@ func TestNormalizeConfigRejectsUnsafeProviderURLs(t *testing.T) {
 }
 
 func authorizeAdmin(req *http.Request, app *App) {
-	req.Header.Set("Authorization", "Bearer "+app.adminToken())
+	req.Header.Set("Authorization", "Bearer test-admin-key")
 }
 
 func testApp(t *testing.T, cfg Config) *App {
 	t.Helper()
+	if strings.TrimSpace(cfg.AdminToken) == "" { cfg.AdminToken = "test-admin-key" }
+	if strings.TrimSpace(cfg.AdminToken) == "" { cfg.AdminToken = "test-admin-key" }
+	if strings.TrimSpace(cfg.AdminToken) == "" { cfg.AdminToken = "test-admin-key" }
 	dir := t.TempDir()
 	path := filepath.Join(dir, "config.json")
 	normalized, err := normalizeConfig(cfg)

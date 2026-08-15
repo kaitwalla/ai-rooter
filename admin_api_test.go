@@ -154,8 +154,11 @@ func TestPublicAPIKeyManagement(t *testing.T) {
 	if rec.Code != http.StatusNoContent {
 		t.Fatalf("delete status = %d body = %s", rec.Code, rec.Body.String())
 	}
-	if len(app.store.Snapshot().PublicAPIKeys) != 0 {
-		t.Fatalf("keys = %#v", app.store.Snapshot().PublicAPIKeys)
+	deletedHash := hashAPIKey(created["key"])
+	for _, key := range app.store.Snapshot().APIKeys {
+		if key.Hash == deletedHash {
+			t.Fatalf("deleted key is still present: %#v", key)
+		}
 	}
 }
 
