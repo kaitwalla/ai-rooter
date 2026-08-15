@@ -92,6 +92,10 @@ func (a *App) scopedAuthMiddleware(next http.Handler) http.Handler {
 	})
 }
 func (a *App) dispatchScopedEndpoint(w http.ResponseWriter, r *http.Request, next http.Handler) {
+	if r.URL.Path == "/admin/api/config" {
+		a.handleScopedConfig(w, r)
+		return
+	}
 	if r.URL.Path == "/admin/api/api-keys" {
 		a.handleScopedAPIKeys(w, r)
 		return
@@ -302,6 +306,22 @@ func (a *App) handleScopedAPIKey(w http.ResponseWriter, r *http.Request) {
 			writeProblem(w, http.StatusBadRequest, "invalid JSON", err.Error())
 			return
 		}
+		if body.Permissions != nil {
+			for _, p := range *body.Permissions {
+				if !validAPIPermission(p) {
+					writeProblem(w, http.StatusBadRequest, "invalid permission", p)
+					return
+				}
+			}
+			if callerKey, isKeyAuth := r.Context().Value("scopedAPIKey").(APIKey); isKeyAuth {
+				for _, p := range *body.Permissions {
+					if !slices.Contains(callerKey.Permissions, p) {
+						writeProblem(w, http.StatusForbidden, "permission escalation denied", fmt.Sprintf("caller lacks %s permission", p))
+						return
+					}
+				}
+			}
+		}
 		var updated APIKey
 		_, err := a.store.Update(func(cfg *Config) error {
 			for i := range cfg.APIKeys {
@@ -312,11 +332,6 @@ func (a *App) handleScopedAPIKey(w http.ResponseWriter, r *http.Request) {
 					cfg.APIKeys[i].Name = strings.TrimSpace(*body.Name)
 				}
 				if body.Permissions != nil {
-					for _, p := range *body.Permissions {
-						if !validAPIPermission(p) {
-							return fmt.Errorf("invalid permission %q", p)
-						}
-					}
 					cfg.APIKeys[i].Permissions = compactUnique(*body.Permissions)
 				}
 				if body.Enabled != nil {
