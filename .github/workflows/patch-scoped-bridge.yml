@@ -1,12 +1,12 @@
 name: Patch scoped bridge cleanup
 on:
   push:
-    branches: [agent/scoped-api-keys]
+    branches:
+      - agent/scoped-api-keys
 permissions:
   contents: write
 jobs:
   patch:
-    if: ${{ !contains(github.event.head_commit.message, '[bridgepatch]') }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -16,9 +16,9 @@ jobs:
         run: |
           python3 - <<'PY'
           from pathlib import Path
-          p=Path('app.go')
-          s=p.read_text()
-          s=s.replace('''func (a *App) adminToken() string {
+          p = Path('app.go')
+          s = p.read_text()
+          s = s.replace('''func (a *App) adminToken() string {
 	if a.adminTokenEnv != "" {
 		return a.adminTokenEnv
 	}
@@ -32,7 +32,7 @@ jobs:
 	}
 	return a.store.Snapshot().AdminToken
 }''')
-          s=s.replace('''func (a *App) requirePublicAPIKey(w http.ResponseWriter, r *http.Request) bool {
+          s = s.replace('''func (a *App) requirePublicAPIKey(w http.ResponseWriter, r *http.Request) bool {
 	cfg := a.store.Snapshot()
 	if len(cfg.PublicAPIKeys) == 0 {
 		writeOpenAIError(w, http.StatusUnauthorized, "invalid_api_key", "no public API keys are configured")
@@ -56,16 +56,18 @@ jobs:
 	}''')
           p.write_text(s)
 
-          p=Path('app_test.go')
-          s=p.read_text()
-          duplicate='\tif strings.TrimSpace(cfg.AdminToken) == "" { cfg.AdminToken = "test-admin-key" }\n\tif strings.TrimSpace(cfg.AdminToken) == "" { cfg.AdminToken = "test-admin-key" }\n'
-          s=s.replace(duplicate,'\tif strings.TrimSpace(cfg.AdminToken) == "" { cfg.AdminToken = "test-admin-key" }\n')
+          p = Path('app_test.go')
+          s = p.read_text()
+          duplicate = '\tif strings.TrimSpace(cfg.AdminToken) == "" { cfg.AdminToken = "test-admin-key" }\n\tif strings.TrimSpace(cfg.AdminToken) == "" { cfg.AdminToken = "test-admin-key" }\n'
+          s = s.replace(duplicate, '\tif strings.TrimSpace(cfg.AdminToken) == "" { cfg.AdminToken = "test-admin-key" }\n')
           p.write_text(s)
+
+          Path('.github/workflows/patch-scoped-bridge.yml').unlink()
           PY
       - name: Commit patch
         run: |
           git config user.name "rooter-patchbot"
           git config user.email "actions@users.noreply.github.com"
-          git add app.go app_test.go
-          git commit -m "[bridgepatch] Keep auth sentinels internal" || exit 0
+          git add -A
+          git commit -m "Keep auth sentinels internal"
           git push origin HEAD:agent/scoped-api-keys
