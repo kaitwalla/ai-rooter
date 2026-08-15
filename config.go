@@ -2,6 +2,7 @@ package main
 
 import (
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -18,13 +19,33 @@ import (
 
 const redactedSecret = "********"
 
+const (
+	internalPublicAuthSentinel = "__rooter_scoped_public_auth__"
+	internalAdminAuthSentinel  = "__rooter_scoped_admin_auth__"
+)
+
 type Config struct {
-	PublicAPIKeys []string       `json:"public_api_keys"`
-	AdminToken    string         `json:"admin_token"`
+	// Legacy plaintext credentials are accepted for migration only. They are
+	// deliberately stripped before config is persisted.
+	PublicAPIKeys []string       `json:"public_api_keys,omitempty"`
+	AdminToken    string         `json:"admin_token,omitempty"`
+	APIKeys       []APIKey       `json:"api_keys,omitempty"`
 	Providers     []Provider     `json:"providers"`
 	Chains        []ModelChain   `json:"chains,omitempty"`
 	Models        []ModelMapping `json:"models"`
 	UpdatedAt     time.Time      `json:"updated_at"`
+}
+
+type APIKey struct {
+	ID          string     `json:"id"`
+	Name        string     `json:"name"`
+	Prefix      string     `json:"prefix"`
+	Hash        string     `json:"hash"`
+	Permissions []string   `json:"permissions"`
+	Enabled     bool       `json:"enabled"`
+	CreatedAt   time.Time  `json:"created_at"`
+	ExpiresAt   *time.Time `json:"expires_at,omitempty"`
+	LastUsedAt  *time.Time `json:"last_used_at,omitempty"`
 }
 
 type Provider struct {
@@ -59,9 +80,10 @@ type ChainStep struct {
 }
 
 type Store struct {
-	path string
-	mu   sync.RWMutex
-	cfg  Config
+	path         string
+	mu           sync.RWMutex
+	cfg          Config
+	scopedBridge bool
 }
 
 func NewStore(path string) (*Store, error) {
@@ -72,10 +94,21 @@ func NewStore(path string) (*Store, error) {
 	return store, nil
 }
 
+func (s *Store) EnableScopedAuthBridge() {
+	s.mu.Lock()
+	s.scopedBridge = true
+	s.mu.Unlock()
+}
+
 func (s *Store) Snapshot() Config {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	return cloneConfig(s.cfg)
+	out := cloneConfig(s.cfg)
+	if s.scopedBridge {
+		out.PublicAPIKeys = append(out.PublicAPIKeys, internalPublicAuthSentinel)
+		out.AdminToken = internalAdminAuthSentinel
+	}
+	return out
 }
 
 func (s *Store) Replace(next Config) error {
@@ -96,19 +129,19 @@ func (s *Store) Replace(next Config) error {
 
 func (s *Store) load() error {
 	if _, err := os.Stat(s.path); errors.Is(err, os.ErrNotExist) {
+		bootstrap := generateAdminToken()
 		cfg := Config{
-			AdminToken: generateAdminToken(),
-			Providers: []Provider{
-				{
-					ID:      "local-ollama",
-					Name:    "Local Ollama",
-					Type:    "ollama",
-					BaseURL: "http://localhost:11434/api",
-					Enabled: true,
-				},
-			},
+			AdminToken: bootstrap,
+			Providers: []Provider{{
+				ID:      "local-ollama",
+				Name:    "Local Ollama",
+				Type:    "ollama",
+				BaseURL: "http://localhost:11434/api",
+				Enabled: true,
+			}},
 			Models: []ModelMapping{},
 		}
+		fmt.Fprintf(os.Stderr, "Rooter bootstrap API key (save it now): %s\n", bootstrap)
 		normalized, err := normalizeConfig(cfg)
 		if err != nil {
 			return err
@@ -131,14 +164,18 @@ func (s *Store) load() error {
 	if err := json.Unmarshal(data, &cfg); err != nil {
 		return fmt.Errorf("read config %s: %w", s.path, err)
 	}
+	if len(cfg.APIKeys) == 0 && len(cfg.PublicAPIKeys) == 0 && strings.TrimSpace(cfg.AdminToken) == "" {
+		bootstrap := generateAdminToken()
+		cfg.AdminToken = bootstrap
+		fmt.Fprintf(os.Stderr, "Rooter bootstrap API key (save it now): %s\n", bootstrap)
+	}
 	normalized, err := normalizeConfig(cfg)
 	if err != nil {
 		return err
 	}
-	if normalized.AdminToken != cfg.AdminToken {
-		if err := writeConfigAtomic(s.path, normalized); err != nil {
-			return err
-		}
+	// Always rewrite on load so legacy plaintext credentials are removed.
+	if err := writeConfigAtomic(s.path, normalized); err != nil {
+		return err
 	}
 	s.cfg = normalized
 	return nil
@@ -146,10 +183,11 @@ func (s *Store) load() error {
 
 func normalizeConfig(cfg Config) (Config, error) {
 	cfg.AdminToken = strings.TrimSpace(cfg.AdminToken)
-	if cfg.AdminToken == "" {
-		cfg.AdminToken = generateAdminToken()
-	}
 	cfg.PublicAPIKeys = compactUnique(cfg.PublicAPIKeys)
+	if cfg.APIKeys == nil {
+		cfg.APIKeys = []APIKey{}
+	}
+	migrateLegacyCredentials(&cfg)
 	if cfg.Providers == nil {
 		cfg.Providers = []Provider{}
 	}
@@ -158,6 +196,37 @@ func normalizeConfig(cfg Config) (Config, error) {
 	}
 	if cfg.Models == nil {
 		cfg.Models = []ModelMapping{}
+	}
+
+	keyIDs := map[string]bool{}
+	for i := range cfg.APIKeys {
+		key := &cfg.APIKeys[i]
+		key.ID = slugify(key.ID)
+		key.Name = strings.TrimSpace(key.Name)
+		key.Prefix = strings.TrimSpace(key.Prefix)
+		key.Hash = strings.ToLower(strings.TrimSpace(key.Hash))
+		key.Permissions = compactUnique(key.Permissions)
+		if key.ID == "" {
+			key.ID = fmt.Sprintf("key-%d", i+1)
+		}
+		if keyIDs[key.ID] {
+			return cfg, fmt.Errorf("duplicate API key id %q", key.ID)
+		}
+		keyIDs[key.ID] = true
+		if key.Name == "" {
+			key.Name = key.ID
+		}
+		if key.Hash == "" {
+			return cfg, fmt.Errorf("API key %q is missing its hash", key.ID)
+		}
+		if key.CreatedAt.IsZero() {
+			key.CreatedAt = time.Now().UTC()
+		}
+		for _, permission := range key.Permissions {
+			if !validAPIPermission(permission) {
+				return cfg, fmt.Errorf("API key %q has unknown permission %q", key.ID, permission)
+			}
+		}
 	}
 
 	providerIDs := map[string]bool{}
@@ -299,12 +368,57 @@ func normalizeConfig(cfg Config) (Config, error) {
 	return cfg, nil
 }
 
-func generateAdminToken() string {
-	var bytes [32]byte
-	if _, err := rand.Read(bytes[:]); err != nil {
-		panic(fmt.Sprintf("generate admin token: %v", err))
+func migrateLegacyCredentials(cfg *Config) {
+	now := time.Now().UTC()
+	for i, raw := range cfg.PublicAPIKeys {
+		raw = strings.TrimSpace(raw)
+		if raw == "" || raw == internalPublicAuthSentinel {
+			continue
+		}
+		appendMigratedAPIKey(cfg, raw, fmt.Sprintf("Migrated API key %d", i+1), publicAPIPermissions(), now)
 	}
-	return "rta_" + hex.EncodeToString(bytes[:])
+	if raw := strings.TrimSpace(cfg.AdminToken); raw != "" && raw != internalAdminAuthSentinel {
+		appendMigratedAPIKey(cfg, raw, "Migrated admin key", allAPIPermissions(), now)
+	}
+}
+
+func appendMigratedAPIKey(cfg *Config, raw, name string, permissions []string, now time.Time) {
+	hash := hashAPIKey(raw)
+	for _, key := range cfg.APIKeys {
+		if key.Hash == hash {
+			return
+		}
+	}
+	prefix := raw
+	if len(prefix) > 12 {
+		prefix = prefix[:12]
+	}
+	cfg.APIKeys = append(cfg.APIKeys, APIKey{
+		ID:          fmt.Sprintf("migrated-%s", hash[:12]),
+		Name:        name,
+		Prefix:      prefix,
+		Hash:        hash,
+		Permissions: permissions,
+		Enabled:     true,
+		CreatedAt:   now,
+	})
+}
+
+func hashAPIKey(raw string) string {
+	sum := sha256.Sum256([]byte(raw))
+	return hex.EncodeToString(sum[:])
+}
+
+func generateAdminToken() string {
+	return generateRawAPIKey()
+}
+
+func generateRawAPIKey() string {
+	var b [32]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		panic(fmt.Sprintf("generate API key: %v", err))
+	}
+	return "rtk_" + hex.EncodeToString(b[:])
 }
 
 func validateProviderBaseURL(raw string) error {
@@ -346,7 +460,10 @@ func writeConfigAtomic(path string, cfg Config) error {
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		return err
 	}
-	data, err := json.MarshalIndent(cfg, "", "  ")
+	persisted := cloneConfig(cfg)
+	persisted.PublicAPIKeys = nil
+	persisted.AdminToken = ""
+	data, err := json.MarshalIndent(persisted, "", "  ")
 	if err != nil {
 		return err
 	}
@@ -361,6 +478,10 @@ func writeConfigAtomic(path string, cfg Config) error {
 func cloneConfig(cfg Config) Config {
 	out := cfg
 	out.PublicAPIKeys = slices.Clone(cfg.PublicAPIKeys)
+	out.APIKeys = slices.Clone(cfg.APIKeys)
+	for i := range out.APIKeys {
+		out.APIKeys[i].Permissions = slices.Clone(cfg.APIKeys[i].Permissions)
+	}
 	out.Providers = slices.Clone(cfg.Providers)
 	out.Chains = slices.Clone(cfg.Chains)
 	for i := range out.Chains {
